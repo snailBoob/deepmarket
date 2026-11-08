@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>deepmarket</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div id="fatal"></div>
+<div id="tabs">
+  <div id="tablist"></div>
+  <div class="tab add" id="btn-add" title="Add a coin">+</div>
+  <div id="status"></div>
+  <div id="sliders">
+    <label title="Volume Dots — Size (0–100)"><span class="slider-name">Size</span>
+      <input type="range" id="s-dot" data-setting="volumeDotSize" aria-label="Volume Dots size" min="0" max="100" step="1"><output for="s-dot"></output></label>
+    <label title="Heatmap — Lower cut-off (%)"><span class="slider-name">Cut-off</span>
+      <input type="range" id="s-cut" data-setting="lowerCutoff" aria-label="Lower cut-off" min="0" max="99" step="1"><output for="s-cut"></output></label>
+    <label title="Heatmap dimming: 100 = undimmed, 0 = fully dimmed"><span class="slider-name">Dimming</span>
+      <input type="range" id="s-dim" data-setting="heatmapIntensity" aria-label="Heatmap dimming" min="0" max="100" step="1"><output for="s-dim"></output></label>
+    <button id="units" class="toggle" title="Sizes in coins or in USDT">USDT</button>
+  </div>
+  <select id="tz" title="Time zone of the time axis"></select>
+  <button id="btn-settings" class="toggle" popovertarget="display-settings" title="Volume Dots / Heatmap settings">Settings</button>
+</div>
+<div id="colheads"><span id="head-cob">COB</span><span id="head-svp">SVP</span></div>
+<div id="chart">
+  <canvas id="heat"></canvas>
+  <canvas id="overlay"></canvas>
+  <button id="btn-back" class="navbtn" title="Back in time">&lt;</button>
+  <button id="btn-live" class="navbtn" title="Back to live (End)">Live &#9654;</button>
+  <div id="empty">No coins open. Click <button id="empty-add" type="button" aria-label="Add a coin">+</button> to add one.</div>
+</div>
+<div id="statusbar"><span id="hover"></span><span id="app-version"></span><span id="conn"></span></div>
+
+<!-- Instrument subscription dialog. Also used to change an open tab.
+     Custom dropdowns (the dark .dd lists): native selects/datalists break the theme. -->
+<div id="dlg" class="modal">
+  <form class="box" id="dlg-form" autocomplete="off">
+    <div class="title" id="dlg-title">Add coin</div>
+    <label>Platform:
+      <span class="dd" id="dd-platform"><input type="hidden" id="dlg-platform" value="BNF"></span></label>
+    <label>Symbol:
+      <span class="ac"><input id="dlg-symbol" placeholder="e.g. ALTUSDT" spellcheck="false" autocomplete="off">
+        <button type="button" class="sym-caret" id="sym-caret" title="All symbols" tabindex="-1"></button>
+        <span class="dd-list" id="sym-list"></span></span></label>
+    <div class="sub">Advanced options</div>
+    <label>History:<span class="fixed">4 hours, from when the tab opens</span></label>
+    <label>Tick size:
+      <span class="dd" id="dd-tick"><input type="hidden" id="dlg-tick"></span></label>
+    <label>Size granularity:
+      <span class="dd" id="dd-size"><input type="hidden" id="dlg-sizegran"></span></label>
+    <div class="err" id="dlg-err"></div>
+    <div class="buttons">
+      <button type="submit" id="dlg-ok">Subscribe</button>
+      <button type="button" id="dlg-cancel">Cancel</button>
+    </div>
+  </form>
+</div>
+<div id="display-settings" popover="auto" role="dialog" aria-labelledby="settings-title">
+  <div class="settings-heading"><h1 id="settings-title">Chart settings</h1></div>
+  <div class="settings-columns">
+    <section aria-labelledby="heatmap-title">
+      <h2 id="heatmap-title">Heatmap</h2>
+      <div class="settings-controls">
+        <label for="set-lower">Lower cut-off (%)</label><input type="range" data-setting="lowerCutoff" aria-label="Lower cut-off slider" min="0" max="99" step="1"><input id="set-lower" data-setting="lowerCutoff" type="number" min="0" max="99" step="1">
+        <label for="set-upper">Upper cut-off (%)</label><input type="range" data-setting="upperCutoff" aria-label="Upper cut-off slider" min="1" max="100" step="1"><input id="set-upper" data-setting="upperCutoff" type="number" min="1" max="100" step="1">
+        <label for="set-dimming" title="100 = undimmed, 0 = fully dimmed">Dimming</label><input type="range" data-setting="heatmapIntensity" aria-label="Dimming slider" min="0" max="100" step="1"><input id="set-dimming" data-setting="heatmapIntensity" type="number" min="0" max="100" step="1">
+      </div>
+      <div class="settings-controls">
+        <label for="set-brightness">Brightness</label><input type="range" data-setting="brightness" aria-label="Brightness slider" min="0" max="100" step="1"><input id="set-brightness" data-setting="brightness" type="number" min="0" max="100" step="1">
+        <label for="set-contrast">Contrast</label><input type="range" data-setting="contrast" aria-label="Contrast slider" min="-100" max="100" step="1"><input id="set-contrast" data-setting="contrast" type="number" min="-100" max="100" step="1">
+      </div>
+      <h3>Automatic adjustment</h3>
+      <label class="settings-check"><input id="set-recenter" data-setting="adjustOnRecenter" type="checkbox">Adjust on recentering</label>
+      <div class="settings-interval"><label class="settings-check"><input id="set-timed" data-setting="adjustByTime" type="checkbox">Adjust every</label><input id="set-interval" data-setting="adjustInterval" aria-label="Adjustment interval in seconds" type="number" min="0.25" max="3600" step="any"><span>seconds</span></div>
+    </section>
+    <section aria-labelledby="volume-dots-title">
+      <h2 id="volume-dots-title">Volume Dots</h2>
+      <div class="settings-controls">
+        <label for="set-size">Size</label><input type="range" data-setting="volumeDotSize" aria-label="Dot size slider" min="0" max="100" step="1"><input id="set-size" data-setting="volumeDotSize" type="number" min="0" max="100" step="1">
+        <label for="set-clustering">Clustering</label><input type="range" data-setting="clustering" aria-label="Clustering slider" min="0" max="100" step="1"><input id="set-clustering" data-setting="clustering" type="number" min="0" max="100" step="1">
+        <label for="set-transparency">Transparency</label><input type="range" data-setting="transparency" aria-label="Transparency slider" min="0" max="100" step="1"><input id="set-transparency" data-setting="transparency" type="number" min="0" max="100" step="1">
+      </div>
+      <div class="settings-values">
+        <label for="set-min-volume">Minimal displayed volume</label><input id="set-min-volume" data-setting="minVolume" type="number" min="0" max="1000000000000" step="any">
+        <label for="set-min-trade">Minimal trade size</label><input id="set-min-trade" data-setting="minTradeSize" type="number" min="0" max="1000000000000" step="any">
+      </div>
+    </section>
+  </div>
+  <div class="settings-footer"><button id="settings-restore" type="button">Restore</button><span id="settings-save-status" role="status"></span><button id="settings-retry" type="button" hidden>Retry saving</button><button id="settings-done" type="button">Done</button></div>
+</div>
+<script type="module" src="/static/app.js"></script>
+</body>
+</html>

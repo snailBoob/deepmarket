@@ -1,0 +1,68 @@
+name: Build release assets
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      DEEP_MARKET_IMAGE: deepmarket:v1.0.0
+      DEEP_MARKET_BIND: 127.0.0.1
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Build candidate
+        run: |
+          test "$(python3 -c 'from deep_market import __version__; print(__version__)')" = '1.0.0'
+          docker compose config --quiet
+          docker build --pull --build-arg "REVISION=$GITHUB_SHA" -t "$DEEP_MARKET_IMAGE" .
+          mkdir -p "$RUNNER_TEMP/review/build-inputs"
+          docker image inspect "$DEEP_MARKET_IMAGE" > "$RUNNER_TEMP/review/image-inspect.json"
+          cp Dockerfile requirements.lock "$RUNNER_TEMP/review/build-inputs/"
+      - name: Test packaged backend
+        run: |
+          for suite in test_feed test_store test_server test_logging; do
+            docker run --rm --network none --entrypoint python -v "$PWD/tests:/app/tests:ro" "$DEEP_MARKET_IMAGE" -m "tests.$suite"
+          done
+      - name: Check container lifecycle
+        run: python3 tools/container_check.py
+      - name: Collect exact licenses and sources
+        timeout-minutes: 25
+        run: |
+          docker run --rm --network none --user "$(id -u):$(id -g)" --entrypoint python \
+            -v "$PWD/tools/container_license_inventory.py:/audit/inventory.py:ro" \
+            -v "$RUNNER_TEMP/review:/report" \
+            "$DEEP_MARKET_IMAGE" /audit/inventory.py /report/licenses
+          mkdir -p "$RUNNER_TEMP/source-review"
+          docker run --rm --user 0:0 --entrypoint python \
+            -e DEEP_MARKET_SOURCE_REVIEW=1 \
+            -v "$PWD/tools/collect_dependency_sources.py:/audit/collect.py:ro" \
+            -v "$RUNNER_TEMP/review:/evidence:ro" \
+            -v "$RUNNER_TEMP/source-review:/sources" \
+            "$DEEP_MARKET_IMAGE" /audit/collect.py /evidence /sources/bundle
+      - name: Package the tested image and matching sources
+        run: |
+          mkdir -p "$RUNNER_TEMP/release"
+          docker save "$DEEP_MARKET_IMAGE" | gzip > "$RUNNER_TEMP/release/deepmarket-v1.0.0-linux-amd64.tar.gz"
+          tar -czf "$RUNNER_TEMP/release/third-party-sources-v1.0.0.tar.gz" -C "$RUNNER_TEMP/source-review" bundle
+          cp compose.yaml "$RUNNER_TEMP/release/"
+          docker image inspect --format '{{.Id}}' "$DEEP_MARKET_IMAGE" > "$RUNNER_TEMP/release/IMAGE_ID"
+          cd "$RUNNER_TEMP/release"
+          sha256sum *.gz compose.yaml IMAGE_ID > SHA256SUMS
+      - name: Store release candidate assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-v1.0.0-${{ github.sha }}
+          path: ${{ runner.temp }}/release/
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
+      - name: Clean up isolated verification environment
+        if: always()
+        run: |
+          docker compose -p deepmarket-check logs --no-color
+          docker compose -p deepmarket-check down --volumes --remove-orphans

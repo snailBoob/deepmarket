@@ -1,0 +1,16 @@
+**
+!Dockerfile
+!requirements.lock
+!compose.yaml
+!README.md
+!docs/
+!docs/deepmarket.png
+!LICENSE
+!THIRD_PARTY_NOTICES.md
+!CONTRIBUTING.md
+!deep_market/
+!deep_market/**
+!web/
+!web/**
+**/__pycache__/
+**/*.pyc
