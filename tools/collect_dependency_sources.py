@@ -17,16 +17,23 @@ from urllib.parse import quote
 from urllib.request import urlopen
 
 
-# Reviewed NumPy 2.5.4 Linux x86_64 wheel. A new binary hash must be reviewed
+# Reviewed NumPy 2.5.4 Linux amd64 and arm64 wheels. New binary hashes must be reviewed
 # again rather than silently inheriting these source mappings.
 # scipy-openblas64 0.3.34.106.0's auditwheel SBOM identifies the AlmaLinux
 # runtime package version; its annotated release tag pins the recipe and
 # OpenBLAS submodule below. Parent-wheel .text/.rodata and all other sections
-# except dynamic linking metadata match the NumPy-bundled binaries.
+# except dynamic linking metadata match the NumPy-bundled binaries. ARM64
+# OpenBLAS also relocates the two corresponding section symbols in .symtab.
 NUMPY_NATIVE_SOURCES = {
-    'a6a368328d02a5d8a149746f13f6268f8cc9192df5c18777b25c3c9b5ef52160': 'gcc',
-    '6bc3069003caec1f075be3c51ae8355332f081fa9465910c4b5724e7fe7d8ad4': 'gcc',
-    '432e1c1739731468ba305771af96773939e43016643e2d630f58cb45b6670e96': 'openblas',
+    'amd64': {
+        'a6a368328d02a5d8a149746f13f6268f8cc9192df5c18777b25c3c9b5ef52160': 'gcc',
+        '6bc3069003caec1f075be3c51ae8355332f081fa9465910c4b5724e7fe7d8ad4': 'gcc',
+        '432e1c1739731468ba305771af96773939e43016643e2d630f58cb45b6670e96': 'openblas',
+    },
+    'arm64': {
+        '25899a29a06d3f2927021b4823d858558839fea0e7e759eedb8926fd0a339ea4': 'gcc',
+        'e58b9ec0d373252b70f37d9dc891d7183a4f57f062db87f38e9a1bf7442d3037': 'openblas',
+    },
 }
 NATIVE_ARCHIVES = [
     ('gcc', 'gcc-8.5.0-28.el8_10.alma.1.src.rpm',
@@ -38,15 +45,20 @@ NATIVE_ARCHIVES = [
     ('recipe', 'openblas-libs-78fc0eaf6de71d92fd98f74f7e5bfa356a2f83e3.tar.gz',
      'https://codeload.github.com/MacPython/openblas-libs/tar.gz/78fc0eaf6de71d92fd98f74f7e5bfa356a2f83e3',
      'ce4197b8d3c006370d3ee0f4e2d9d4940480b649a62fa209a405d419666cfb6b'),
-    ('provenance', 'scipy_openblas64-0.3.34.106.0-py3-none-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl',
+]
+NATIVE_PROVENANCE = {
+    'amd64': ('provenance', 'scipy_openblas64-0.3.34.106.0-py3-none-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl',
      'https://files.pythonhosted.org/packages/3a/87/127a5870cf8cb84b275046084ec93d9e218616fafff257ffb6e04b76499b/scipy_openblas64-0.3.34.106.0-py3-none-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl',
      'e3d0667352f91ad851141a99eb326a6bbb4142db898e4f68bff8665247f0e951'),
-]
+    'arm64': ('provenance', 'scipy_openblas64-0.3.34.106.0-py3-none-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl',
+     'https://files.pythonhosted.org/packages/61/8c/28eab44e05def6a008c109024a8c0159efd88a76e95892c888a1469d17f8/scipy_openblas64-0.3.34.106.0-py3-none-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl',
+     'e038d5a53076f901a6f7175447df0b3fa015b31c49eba12c2709d550eee5af14'),
+}
 
 
-def native_source_mapping(package, binary):
+def native_source_mapping(package, binary, architecture):
     if package['name'].lower() == 'numpy' and package['version'] == '2.5.4':
-        return NUMPY_NATIVE_SOURCES.get(binary['sha256'])
+        return NUMPY_NATIVE_SOURCES.get(architecture, {}).get(binary['sha256'])
     return None
 
 
@@ -148,6 +160,9 @@ def collect(evidence, output):
     output.mkdir(parents=True, exist_ok=False)
     inventory = json.loads((evidence / 'licenses/inventory.json').read_text())
     image = json.loads((evidence / 'image-inspect.json').read_text())[0]
+    architecture = image['Architecture']
+    if image['Os'] != 'linux' or architecture not in NATIVE_PROVENANCE:
+        raise ValueError(f'Unsupported image platform: {image["Os"]}/{architecture}')
     shutil.copytree(evidence / 'licenses', output / 'license-evidence')
     shutil.copy2(evidence / 'image-inspect.json', output / 'image-inspect.json')
     if (evidence / 'build-inputs').exists():
@@ -175,7 +190,7 @@ def collect(evidence, output):
             failures.append({'component': label, 'reason': str(exc)})
         for binary in package['native_binaries']:
             if '.libs/' in binary['path']:
-                source = native_source_mapping(package, binary)
+                source = native_source_mapping(package, binary, architecture)
                 if source:
                     native_mappings.append({'binary': binary['path'],
                                             'binary_sha256': binary['sha256'],
@@ -188,7 +203,7 @@ def collect(evidence, output):
                 })
 
     if native_mappings:
-        for component, filename, url, digest in NATIVE_ARCHIVES:
+        for component, filename, url, digest in [*NATIVE_ARCHIVES, NATIVE_PROVENANCE[architecture]]:
             try:
                 path = output / 'native' / filename
                 record = download(url, path, digest)
@@ -245,7 +260,8 @@ def collect(evidence, output):
             except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as exc:
                 failures.append({'component': label, 'reason': str(exc)})
 
-    report = {'image_id': image['Id'], 'archives': archives, 'download_failures': failures,
+    report = {'image_id': image['Id'], 'platform': f'linux/{architecture}',
+              'archives': archives, 'download_failures': failures,
               'native_source_mappings': native_mappings,
               'downloads_complete': not failures, 'coverage_gaps': coverage_gaps,
               'source_coverage_complete': not failures and not coverage_gaps}

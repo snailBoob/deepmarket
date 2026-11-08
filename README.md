@@ -20,28 +20,46 @@ it does not place trades. Historical heatmap data starts when you open a tab.
 
 ## Run with Docker
 
-Requirements: Docker Engine with Compose v2 (or Docker Desktop), a Linux/amd64
-container environment and a modern desktop browser with WebGL. Native ARM images
-are not provided in this release. The browser renders the charts; the server
-does not need a GPU.
+Requirements: Docker Engine with Compose v2 (or Docker Desktop) and a modern
+desktop browser with WebGL. The browser renders the charts; the server does not
+need a GPU.
 
-Download `deepmarket-v1.0.0-linux-amd64.tar.gz`, `compose.yaml` and `SHA256SUMS`
-from [release v1.0.0](https://github.com/snailBoob/deepmarket/releases/tag/v1.0.0).
-Put them in a dedicated directory, then run:
+Choose the image for the computer running Docker:
+
+| Computer | Architecture | Image download |
+| --- | --- | --- |
+| Apple Silicon Mac (M-series), with Docker Desktop | ARM64 | `deepmarket-v1.1.0-linux-arm64.tar.gz` |
+| ARM64 Linux server or Raspberry Pi with a 64-bit OS | ARM64 | `deepmarket-v1.1.0-linux-arm64.tar.gz` |
+| Intel/AMD Linux or Windows computer, or Intel Mac, using Linux containers | AMD64 | `deepmarket-v1.1.0-linux-amd64.tar.gz` |
+
+Both images contain Linux applications. Docker Desktop runs the ARM64 image
+natively on Apple Silicon, without x86 emulation. 32-bit ARM is not supported.
+On Linux, `uname -m` reports `aarch64` for ARM64 or `x86_64` for AMD64.
+
+From [release v1.1.0](https://github.com/snailBoob/deepmarket/releases/tag/v1.1.0),
+download the matching image, `compose.yaml` and `SHA256SUMS-linux-arm64` or
+`SHA256SUMS-linux-amd64`. Put them in a dedicated directory.
+
+For **Apple Silicon or ARM64 Linux**:
 
 ```sh
-sha256sum --check --ignore-missing SHA256SUMS
-docker load -i deepmarket-v1.0.0-linux-amd64.tar.gz
+docker load -i deepmarket-v1.1.0-linux-arm64.tar.gz
 docker compose up -d --wait
 ```
 
-The checksum command above is for Linux. On macOS use `shasum -a 256` on the
-downloaded image and compare it with its entry in `SHA256SUMS`.
+For **AMD64**, use `docker load -i deepmarket-v1.1.0-linux-amd64.tar.gz`, followed
+by the same Compose command. Use only the image for your Docker host's architecture;
+both images use the local tag `deepmarket:v1.1.0`.
+
+To verify downloads on Linux, use
+`sha256sum --check --ignore-missing SHA256SUMS-linux-arm64` (or `-amd64`).
+On macOS, run `shasum -a 256 deepmarket-v1.1.0-linux-arm64.tar.gz` and compare
+the result with the matching entry in `SHA256SUMS-linux-arm64`.
 
 ### Build from source
 
 Alternatively, download the release's source archive, extract it and run from
-that directory:
+that directory. Docker builds for the host's native architecture by default:
 
 ```sh
 docker build -t deepmarket:local .

@@ -30,10 +30,13 @@ The following license metadata was inspected for those versions:
 
 Installed distributions retain their license and NOTICE files under their
 `.dist-info/` directories. Copies are also provided in the release's
-`third-party-sources-v1.0.0.tar.gz` archive, under `bundle/license-evidence/`.
+`third-party-sources-v1.1.0-linux-amd64.tar.gz` or
+`third-party-sources-v1.1.0-linux-arm64.tar.gz` archive, under
+`bundle/license-evidence/`. Select the archive for the image you downloaded.
 
-The Linux/amd64 NumPy wheel includes OpenBLAS/LAPACK, libgfortran (GPL with
-the GCC runtime exception) and libquadmath (LGPL). orjson includes MPL-covered
+The NumPy wheels include OpenBLAS/LAPACK and libgfortran (GPL with the GCC runtime
+exception). The AMD64 wheel additionally includes libquadmath (LGPL).
+orjson includes MPL-covered
 material. Their matching sources, patches and build recipes are included in the
 same archive. `source-manifest.json` identifies the exact component versions and
 checksums. The archive includes the orjson vendored Rust sources and the GCC
