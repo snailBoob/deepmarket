@@ -1,0 +1,183 @@
+name: Publish release to GHCR
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing public release to publish
+        required: true
+        default: v1.1.1
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ghcr-publication
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/snailboob/deepmarket
+  TAG: ${{ inputs.tag || github.event.release.tag_name }}
+
+jobs:
+  publish:
+    name: Verify and push linux/${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      DEEP_MARKET_BIND: 127.0.0.1
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.tag || github.event.release.tag_name }}
+      - name: Download the released image and verify its identity
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$TAG" = "v$(python3 -c 'from deep_market import __version__; print(__version__)')"
+          gh release view "$TAG" --json isDraft,isPrerelease --jq '[.isDraft,.isPrerelease] | all(. == false)' | grep -qx true
+          gh release view "$TAG" --json assets --jq '.assets[].name' | grep -Fx "third-party-sources-$TAG-linux-$ARCH.tar.gz"
+          mkdir -p "$RUNNER_TEMP/release"
+          gh release download "$TAG" --dir "$RUNNER_TEMP/release" \
+            --pattern "deepmarket-$TAG-linux-$ARCH.tar.gz" \
+            --pattern "IMAGE_ID-linux-$ARCH" --pattern "SHA256SUMS-linux-$ARCH" \
+            --pattern compose.yaml
+          (cd "$RUNNER_TEMP/release" && sha256sum --check --ignore-missing "SHA256SUMS-linux-$ARCH")
+          cmp compose.yaml "$RUNNER_TEMP/release/compose.yaml"
+          docker load -i "$RUNNER_TEMP/release/deepmarket-$TAG-linux-$ARCH.tar.gz"
+          test "$(docker image inspect --format '{{.Id}}' "$IMAGE:$TAG")" = "$(cat "$RUNNER_TEMP/release/IMAGE_ID-linux-$ARCH")"
+          test "$(docker image inspect --format '{{.Architecture}}' "$IMAGE:$TAG")" = "$ARCH"
+          docker run --rm --network none --entrypoint python "$IMAGE:$TAG" -c \
+            'import sys; from deep_market import __version__; assert "v" + __version__ == sys.argv[1]' "$TAG"
+          echo "DEEP_MARKET_IMAGE=$IMAGE:$TAG" >> "$GITHUB_ENV"
+      - name: Verify the released backend and container lifecycle
+        run: |
+          for suite in test_feed test_store test_server test_logging; do
+            docker run --rm --network none --entrypoint python -v "$PWD/tests:/app/tests:ro" "$DEEP_MARKET_IMAGE" -m "tests.$suite"
+          done
+          python3 tools/container_check.py
+      - name: Push the exact tested image
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker tag "$DEEP_MARKET_IMAGE" "$IMAGE:$TAG-$ARCH"
+          docker push "$IMAGE:$TAG-$ARCH"
+          mkdir -p "$RUNNER_TEMP/digests"
+          docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE:$TAG-$ARCH" > "$RUNNER_TEMP/digests/$ARCH"
+          cat "$RUNNER_TEMP/digests/$ARCH" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: digest-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/digests/
+          retention-days: 7
+          if-no-files-found: error
+      - name: Clean up
+        if: always()
+        run: |
+          docker compose -p deepmarket-check down --volumes --remove-orphans
+          docker logout ghcr.io
+
+  manifest:
+    name: Publish multi-architecture tags
+    needs: publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Download tested image digests
+        run: |
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/digests" \
+            --name "digest-amd64-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --name "digest-arm64-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+      - name: Publish the version tag
+        run: |
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          AMD64=$(cat "$RUNNER_TEMP/digests/digest-amd64-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/amd64")
+          ARM64=$(cat "$RUNNER_TEMP/digests/digest-arm64-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/arm64")
+          docker buildx imagetools create --tag "$IMAGE:$TAG" "$AMD64" "$ARM64"
+          docker buildx imagetools inspect "$IMAGE:$TAG" >> "$GITHUB_STEP_SUMMARY"
+      - name: Log out
+        if: always()
+        run: docker logout ghcr.io
+
+  verify-public:
+    name: Anonymous install on linux/${{ matrix.arch }}
+    needs: manifest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.tag || github.event.release.tag_name }}
+      - name: Pull anonymously and verify the released image ID
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          echo "DOCKER_CONFIG=$RUNNER_TEMP/anonymous-docker" >> "$GITHUB_ENV"
+          export DOCKER_CONFIG="$RUNNER_TEMP/anonymous-docker"
+          mkdir -p "$DOCKER_CONFIG"
+          docker pull "$IMAGE:$TAG"
+          gh release download "$TAG" --pattern "IMAGE_ID-linux-$ARCH" --dir "$RUNNER_TEMP"
+          test "$(docker image inspect --format '{{.Id}}' "$IMAGE:$TAG")" = "$(cat "$RUNNER_TEMP/IMAGE_ID-linux-$ARCH")"
+          test "$(docker image inspect --format '{{.Architecture}}' "$IMAGE:$TAG")" = "$ARCH"
+          echo "DEEP_MARKET_IMAGE=$IMAGE:$TAG" >> "$GITHUB_ENV"
+      - name: Verify HTTP, WebSocket, shutdown and persistence
+        env:
+          DEEP_MARKET_BIND: 127.0.0.1
+        run: python3 tools/container_check.py
+      - name: Clean up
+        if: always()
+        run: docker compose -p deepmarket-check down --volumes --remove-orphans
+
+  latest:
+    name: Promote the anonymously verified release
+    needs: verify-public
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Update latest only for the current release
+        run: |
+          LATEST=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)
+          if [[ "$TAG" == "$LATEST" ]]; then
+            printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+            docker buildx imagetools create --tag "$IMAGE:latest" "$IMAGE:$TAG"
+            docker buildx imagetools inspect "$IMAGE:latest" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Log out
+        if: always()
+        run: docker logout ghcr.io

@@ -24,36 +24,56 @@ Requirements: Docker Engine with Compose v2 (or Docker Desktop) and a modern
 desktop browser with WebGL. The browser renders the charts; the server does not
 need a GPU.
 
-Choose the image for the computer running Docker:
+Download [`compose.yaml`](https://github.com/snailBoob/deepmarket/releases/download/v1.1.1/compose.yaml)
+into a dedicated directory, then run:
+
+```sh
+docker compose pull
+docker compose up -d --wait
+```
+
+Open **http://localhost:8740**. No GitHub login is needed. Docker automatically
+selects the Linux AMD64 or ARM64 image for your computer, including Apple Silicon.
+The Compose file pins `ghcr.io/snailboob/deepmarket:v1.1.1`.
+
+To download the current release directly:
+
+```sh
+docker pull ghcr.io/snailboob/deepmarket:latest
+```
+
+### Offline image archives
+
+Release archives remain available if you prefer `docker load`:
 
 | Computer | Architecture | Image download |
 | --- | --- | --- |
-| Apple Silicon Mac (M-series), with Docker Desktop | ARM64 | `deepmarket-v1.1.0-linux-arm64.tar.gz` |
-| ARM64 Linux server or Raspberry Pi with a 64-bit OS | ARM64 | `deepmarket-v1.1.0-linux-arm64.tar.gz` |
-| Intel/AMD Linux or Windows computer, or Intel Mac, using Linux containers | AMD64 | `deepmarket-v1.1.0-linux-amd64.tar.gz` |
+| Apple Silicon Mac (M-series), with Docker Desktop | ARM64 | `deepmarket-v1.1.1-linux-arm64.tar.gz` |
+| ARM64 Linux server or Raspberry Pi with a 64-bit OS | ARM64 | `deepmarket-v1.1.1-linux-arm64.tar.gz` |
+| Intel/AMD Linux or Windows computer, or Intel Mac, using Linux containers | AMD64 | `deepmarket-v1.1.1-linux-amd64.tar.gz` |
 
 Both images contain Linux applications. Docker Desktop runs the ARM64 image
 natively on Apple Silicon, without x86 emulation. 32-bit ARM is not supported.
 On Linux, `uname -m` reports `aarch64` for ARM64 or `x86_64` for AMD64.
 
-From [release v1.1.0](https://github.com/snailBoob/deepmarket/releases/tag/v1.1.0),
+From [release v1.1.1](https://github.com/snailBoob/deepmarket/releases/tag/v1.1.1),
 download the matching image, `compose.yaml` and `SHA256SUMS-linux-arm64` or
 `SHA256SUMS-linux-amd64`. Put them in a dedicated directory.
 
 For **Apple Silicon or ARM64 Linux**:
 
 ```sh
-docker load -i deepmarket-v1.1.0-linux-arm64.tar.gz
-docker compose up -d --wait
+docker load -i deepmarket-v1.1.1-linux-arm64.tar.gz
+docker compose up -d --wait --pull never
 ```
 
-For **AMD64**, use `docker load -i deepmarket-v1.1.0-linux-amd64.tar.gz`, followed
+For **AMD64**, use `docker load -i deepmarket-v1.1.1-linux-amd64.tar.gz`, followed
 by the same Compose command. Use only the image for your Docker host's architecture;
-both images use the local tag `deepmarket:v1.1.0`.
+both archives contain the tag `ghcr.io/snailboob/deepmarket:v1.1.1`.
 
 To verify downloads on Linux, use
 `sha256sum --check --ignore-missing SHA256SUMS-linux-arm64` (or `-amd64`).
-On macOS, run `shasum -a 256 deepmarket-v1.1.0-linux-arm64.tar.gz` and compare
+On macOS, run `shasum -a 256 deepmarket-v1.1.1-linux-arm64.tar.gz` and compare
 the result with the matching entry in `SHA256SUMS-linux-arm64`.
 
 ### Build from source
@@ -112,9 +132,10 @@ Compose allows up to 2 GB RAM. A memory guard saves state and restarts the proce
 when its measured memory exceeds 1500 MB. Actual load depends on the instruments
 and activity. Large, active markets may need more resources than quiet altcoins.
 
-Before upgrading, stop the service cleanly and back up its volume. Download and
-load the new release image and use its Compose file in the same directory, then
-repeat the startup command. Keep the previous image and its matching Compose file
+Before upgrading, stop the service cleanly and back up its volume. Download the
+new release's Compose file into the same directory, run `docker compose pull`,
+then `docker compose up -d --wait`. For offline installations, load the matching
+archive instead and use `--pull never`. Keep the previous image and its matching Compose file
 for rollback. Source installations can rebuild their local image. Updates interrupt
 the feed briefly; downtime appears as a gap in history.
 
