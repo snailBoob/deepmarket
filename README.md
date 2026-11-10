@@ -24,7 +24,7 @@ Requirements: Docker Engine with Compose v2 (or Docker Desktop) and a modern
 desktop browser with WebGL. The browser renders the charts; the server does not
 need a GPU.
 
-Download [`compose.yaml`](https://github.com/snailBoob/deepmarket/releases/download/v1.1.1/compose.yaml)
+Download [`compose.yaml`](https://github.com/snailBoob/deepmarket/releases/download/v1.1.2/compose.yaml)
 into a dedicated directory, then run:
 
 ```sh
@@ -34,7 +34,7 @@ docker compose up -d --wait
 
 Open **http://localhost:8740**. No GitHub login is needed. Docker automatically
 selects the Linux AMD64 or ARM64 image for your computer, including Apple Silicon.
-The Compose file pins `ghcr.io/snailboob/deepmarket:v1.1.1`.
+The Compose file pins `ghcr.io/snailboob/deepmarket:v1.1.2`.
 
 To download the current release directly:
 
@@ -48,32 +48,32 @@ Release archives remain available if you prefer `docker load`:
 
 | Computer | Architecture | Image download |
 | --- | --- | --- |
-| Apple Silicon Mac (M-series), with Docker Desktop | ARM64 | `deepmarket-v1.1.1-linux-arm64.tar.gz` |
-| ARM64 Linux server or Raspberry Pi with a 64-bit OS | ARM64 | `deepmarket-v1.1.1-linux-arm64.tar.gz` |
-| Intel/AMD Linux or Windows computer, or Intel Mac, using Linux containers | AMD64 | `deepmarket-v1.1.1-linux-amd64.tar.gz` |
+| Apple Silicon Mac (M-series), with Docker Desktop | ARM64 | `deepmarket-v1.1.2-linux-arm64.tar.gz` |
+| ARM64 Linux server or Raspberry Pi with a 64-bit OS | ARM64 | `deepmarket-v1.1.2-linux-arm64.tar.gz` |
+| Intel/AMD Linux or Windows computer, or Intel Mac, using Linux containers | AMD64 | `deepmarket-v1.1.2-linux-amd64.tar.gz` |
 
 Both images contain Linux applications. Docker Desktop runs the ARM64 image
 natively on Apple Silicon, without x86 emulation. 32-bit ARM is not supported.
 On Linux, `uname -m` reports `aarch64` for ARM64 or `x86_64` for AMD64.
 
-From [release v1.1.1](https://github.com/snailBoob/deepmarket/releases/tag/v1.1.1),
+From [release v1.1.2](https://github.com/snailBoob/deepmarket/releases/tag/v1.1.2),
 download the matching image, `compose.yaml` and `SHA256SUMS-linux-arm64` or
 `SHA256SUMS-linux-amd64`. Put them in a dedicated directory.
 
 For **Apple Silicon or ARM64 Linux**:
 
 ```sh
-docker load -i deepmarket-v1.1.1-linux-arm64.tar.gz
+docker load -i deepmarket-v1.1.2-linux-arm64.tar.gz
 docker compose up -d --wait --pull never
 ```
 
-For **AMD64**, use `docker load -i deepmarket-v1.1.1-linux-amd64.tar.gz`, followed
+For **AMD64**, use `docker load -i deepmarket-v1.1.2-linux-amd64.tar.gz`, followed
 by the same Compose command. Use only the image for your Docker host's architecture;
-both archives contain the tag `ghcr.io/snailboob/deepmarket:v1.1.1`.
+both archives contain the tag `ghcr.io/snailboob/deepmarket:v1.1.2`.
 
 To verify downloads on Linux, use
 `sha256sum --check --ignore-missing SHA256SUMS-linux-arm64` (or `-amd64`).
-On macOS, run `shasum -a 256 deepmarket-v1.1.1-linux-arm64.tar.gz` and compare
+On macOS, run `shasum -a 256 deepmarket-v1.1.2-linux-arm64.tar.gz` and compare
 the result with the matching entry in `SHA256SUMS-linux-arm64`.
 
 ### Build from source

@@ -990,6 +990,13 @@ function updateCluster(c) {
 // gross-volume-weighted trade price, never the aggressor colour.
 function bubbleVolume(c) { return sizeValue(Math.abs(c.delta), c.tick); }
 
+// Fixed for this page lifetime: live scroll, ring eviction and grid refreshes
+// must not perturb distances or tie-breaking between unchanged trades.
+const BUBBLE_TIME_ORIGIN = Date.now();
+function bubbleXOffset(g) {
+  return g.xr - (S.tNewest - BUBBLE_TIME_ORIGIN) * g.pxPerMs;
+}
+
 function tradeClusters(v, g) {
   // Start at screen-pixel resolution, then let Smart overlap merging do the
   // clustering. Source records retain native prices but are time-aggregated into
@@ -1005,7 +1012,8 @@ function tradeClusters(v, g) {
     const slot = (S.head + j) % n;
     const lv = S.tr[slot];  // flat [tick, buy, sell, ...]: trades per price level
     if (!lv) continue;
-    const xc = g.xr - (n - 1 - j) * v.colPx - v.colPx / 2;   // column centre
+    const time = S.tNewest - (n - 1 - j) * v.dt;
+    const xc = (time - BUBBLE_TIME_ORIGIN - v.dt / 2) * g.pxPerMs;
     const bucket = Math.floor((S.tNewest - (n - 1 - j) * v.dt - 1) / span);
     for (let i = 0; i < lv.length; i += 3) {
       const px = lv[i];
@@ -1028,7 +1036,7 @@ function tradeClusters(v, g) {
   return out;
 }
 
-function updateVolRef(clusters) {
+function updateVolRef(clusters, xOffset = 0) {
   // Calibrate once from the first non-empty tape, not from each moving viewport.
   // Otherwise an unrelated new trade (or a zoom/grid replacement) resizes every
   // old dot and even changes its overlap partners. Keep both unit references from
@@ -1036,7 +1044,7 @@ function updateVolRef(clusters) {
   const minTradeSize = S.view.minTradeSize;
   let ref = S.bubbleReference;
   if (!ref || ref.symbol !== S.symbol || ref.minTradeSize !== minTradeSize) {
-    const visible = clusters.filter((c) => c.delta !== 0 && c.x >= 0);
+    const visible = clusters.filter((c) => c.delta !== 0 && c.x + xOffset >= 0);
     // The off-screen overlap margin must not change the initial visible scale.
     const nonzero = visible.length ? visible : clusters.filter((c) => c.delta !== 0);
     if (!nonzero.length) { S.bubbleReference = null; S.volRef = 0; return; }
@@ -1069,7 +1077,7 @@ function bubbleRadius(vol) {
 // may shrink and the colour may flip; gross buy/sell volume is never discarded.
 // Merge candidates are processed in deterministic overlap passes.
 const BUBBLE_OVERLAP = 1 / 1.8; // touching spheres merge at clustering setting 52
-function mergeOverlapping(list, g) {
+function mergeOverlapping(list, g, xOffset = 0) {
   // Growing/moving a merged dot can make two previously separate hosts overlap.
   // Repeat until stable; each non-final pass removes at least one cluster.
   while (true) {
@@ -1081,7 +1089,7 @@ function mergeOverlapping(list, g) {
     const cells = new Map();
     const cellKey = (cx, cy) => `${cx}:${cy}`;
     for (const p of list) {
-      p.y = yOf(g, p.tick);
+      p.y = p.tick * g.ppt;
       p.r = bubbleRadius(bubbleVolume(p));
       const cx = Math.floor(p.x / cell);
       const cy = Math.floor(p.y / cell);
@@ -1112,7 +1120,7 @@ function mergeOverlapping(list, g) {
       host.buy += p.buy; host.sell += p.sell;
       host.xw += p.xw; host.pxw += p.pxw;
       updateCluster(host);
-      host.y = yOf(g, host.tick);
+      host.y = host.tick * g.ppt;
       host.r = bubbleRadius(bubbleVolume(host));
       const newKey = cellKey(Math.floor(host.x / cell), Math.floor(host.y / cell));
       // Weighted placement can move the host across a cell boundary. Keep its
@@ -1124,7 +1132,15 @@ function mergeOverlapping(list, g) {
         (cells.get(newKey) || cells.set(newKey, []).get(newKey)).push(host);
       }
     }
-    if (kept.length === list.length) return kept;
+    if (kept.length === list.length) {
+      // Projection happens only after merging, so subpixel scroll/recentering
+      // cannot change which of two equally near bubbles receives a trade.
+      for (const p of kept) {
+        p.x += xOffset;
+        p.y = yOf(g, p.tick);
+      }
+      return kept;
+    }
     list = kept;
   }
 }
@@ -1169,8 +1185,9 @@ const SPHERE = {
 
 function drawBubbles(v, g) {
   const clusters = tradeClusters(v, g);
-  updateVolRef(clusters);
-  const list = mergeOverlapping(clusters, g);
+  const xOffset = bubbleXOffset(g);
+  updateVolRef(clusters, xOffset);
+  const list = mergeOverlapping(clusters, g, xOffset);
   list.sort((a, b) => a.r - b.r); // small first, so the biggest delta bubble is on top
   const dpr = S.layout.dpr;
   ctx.globalAlpha = 1 - S.set.transparency / 100;
@@ -1550,10 +1567,10 @@ function selectTab(inst) {
 }
 
 async function closeTab(inst) {
-  if (!confirm(`The history of ${inst} will be deleted. Close the tab?`)) return;
   const r = await fetch(`/api/tabs/${encodeURIComponent(inst)}`, { method: "DELETE" });
   if (!r.ok) alert((await r.json().catch(() => ({}))).error || "Closing failed");
-  if (inst === S.symbol) S.symbol = null;  // the meta broadcast picks another tab
+  // onMeta updates the selection and view together, regardless of whether the
+  // broadcast arrives before or after this HTTP response.
 }
 
 // First view of a tab: zoom the price axis so roughly 3% of the price fits on screen.
@@ -1749,8 +1766,15 @@ async function refreshSymbolChoice() {
 }
 
 function onSymbolTyped() {
+  const input = $("dlg-symbol");
+  const upper = input.value.toUpperCase();
+  if (input.value !== upper) {
+    const { selectionStart, selectionEnd, selectionDirection } = input;
+    input.value = upper;
+    input.setSelectionRange(selectionStart, selectionEnd, selectionDirection);
+  }
   const list = symbolLists[$("dlg-platform").value] || [];
-  const sym = $("dlg-symbol").value.trim().toUpperCase();
+  const sym = input.value.trim();
   const hit = list.find((x) => x.symbol === sym);
   $("dlg-ok").disabled = !hit;
   $("dlg-err").textContent = sym && !hit && list.length ? "Unknown coin on this platform" : "";

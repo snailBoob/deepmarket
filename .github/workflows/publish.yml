@@ -7,7 +7,7 @@ on:
       tag:
         description: Existing public release to publish
         required: true
-        default: v1.1.1
+        default: v1.1.2
         type: string
 
 permissions:
