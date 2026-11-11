@@ -11,6 +11,13 @@ Protocol on /ws
      "nrows": 200, "row_ticks": 1, "tick_lo": null | int, "t_end": null | ms}
         tick_lo null = centre on the current price; t_end null = live. Replaces the previous
         view; the server answers with a "grid", "cob", "svp" and then pushes updates.
+        orderflow=1 opts into ordered events [ms,tick,base_qty,side] and "cols"
+        batches. Their times label column starts; replace=true also refreshes the
+        unfinished last column. Sampling is end-of-column (or the latest state
+        for the current column), delivery every 50ms, independent of column width.
+        heat_source_rows optionally requests fixed-point price-row compression;
+        row_ticks remains the source level size, output row width is
+        heat_source_rows*row_ticks/nrows. Legacy clients retain their old contract.
   server -> client:
     text   {"type": "meta", "symbols": {instrument: {symbol, exchange, tick_size, decimals}}}
     binary [uint32 header length][header JSON, padded to 4 bytes][float32 payload]
@@ -150,6 +157,7 @@ def load_tabs():
 
 MAX_COLS = 4000
 MAX_ROWS = 2000
+MAX_ORDERFLOW_ROWS = 8192  # visible 2H rows plus same-density off-screen padding
 # Exchange suffixes used in instrument identifiers (ALTUSDT@BNF).
 SUFFIX = {"BNF": ("binance", binance, binance.BinanceFeed), "BB": ("bybit", bybit, bybit.BybitFeed)}
 
@@ -210,6 +218,21 @@ def _live_levels(recs_list, min_trade_size=0):
 def _round_list(a, nd=6):
     """JSON-friendly list: NaN -> None, rounded to keep the message small."""
     return [None if v != v else round(v, nd) for v in a.tolist()]
+
+
+def _trade_events(parts, minimum=0):
+    """Ordered events, flat [timestamp_ms, native_tick, base_qty, aggressor].
+
+    Stable ordering preserves arrival order for equal timestamps. Unlike levels,
+    this never combines two visits to a price. Opt-in wire field, no storage change.
+    """
+    parts = [r for p in parts if len(r := filter_trades(p, minimum))]
+    if not parts:
+        return []
+    records = np.concatenate(parts) if len(parts) > 1 else parts[0]
+    if len(parts) > 1:
+        records = records[np.argsort(records['t'], kind='stable')]
+    return [v for r in records for v in (int(r['t']), int(r['tick']), float(r['qty']), int(r['side']))]
 
 
 def _best(values, pick):
@@ -468,11 +491,11 @@ class Engine:
         return ticks, sides
 
     @staticmethod
-    def grid(feeds, times, dt, tick_lo, nrows, row_ticks, outward=False, min_trade_size=0):
+    def grid(feeds, times, dt, tick_lo, nrows, row_ticks, outward=False, min_trade_size=0, source_rows=None, exact=False):
         grid = None
         bbs, bas, trades = [], [], []
         for f in feeds:
-            g, bb, ba = f.history.sample_grid(times, tick_lo, nrows, row_ticks, outward)
+            g, bb, ba = f.history.sample_grid(times, tick_lo, nrows, row_ticks, outward, source_rows, exact)
             grid = g if grid is None else grid + g
             bbs.append(bb)
             bas.append(ba)
@@ -518,12 +541,14 @@ class Client:
             return
         exchanges = self._exchanges(msg, symbol)
         feeds = self.engine.feeds(symbol, exchanges)
-        dt = max(10, int(msg.get("dt", 100)))
+        ordered = msg.get("orderflow") == 1
+        dt = max(1 if ordered else 10, int(msg.get("dt", 100)))
         ncols = max(1, min(MAX_COLS, int(msg.get("ncols", 500))))
-        nrows = max(1, min(MAX_ROWS, int(msg.get("nrows", 200))))
+        nrows = max(1, min(MAX_ORDERFLOW_ROWS if ordered else MAX_ROWS, int(msg.get("nrows", 200))))
         row_ticks = max(1, min(100_000, int(msg.get("row_ticks", 1))))
+        source_rows = max(nrows, min(2_000_000, int(msg.get("heat_source_rows", nrows)))) if ordered else nrows
         # Opt-in keeps already-open/cached browsers on their original dense format.
-        profile_ticks = max(1, min(row_ticks, int(msg["profile_row_ticks"]))) if "profile_row_ticks" in msg else 0
+        profile_ticks = max(1, min(row_ticks, int(msg["profile_row_ticks"]))) if "profile_row_ticks" in msg else (row_ticks if ordered else 0)
         outward = msg.get("book_rounding") == "outward"  # old bundles retain their row coordinates
         min_trade_size = float(msg.get("min_trade_size", 0))
         if not np.isfinite(min_trade_size) or min_trade_size < 0:
@@ -534,7 +559,7 @@ class Client:
             if bb < 0 or ba < 0:
                 await self.ws.send_json({"type": "error", "error": "book not synced yet"})
                 return
-            tick_lo = (bb + ba) // 2 - (nrows - int(outward)) * row_ticks // 2
+            tick_lo = (bb + ba) // 2 - (source_rows - int(outward)) * row_ticks // 2
         tick_lo = int(tick_lo) // row_ticks * row_ticks  # rows on a fixed grid: stable binning
         req_end = msg.get("t_end")  # None = live
 
@@ -548,12 +573,18 @@ class Client:
         live = req_end is None or int(req_end) >= clock()
         t_end = (clock() if live else int(req_end)) // dt * dt
         times = t_end - dt * np.arange(ncols - 1, -1, -1, dtype=np.int64)
+        sample_times = times + dt - 1 if ordered else times
         t0 = time.perf_counter()
         grid, bb, ba, bv, bp, sv, sp, levels = self.engine.grid(
-            feeds, times, dt, tick_lo, nrows, row_ticks, outward, min_trade_size)
+            feeds, sample_times, dt, tick_lo, nrows, row_ticks, outward, min_trade_size, source_rows, ordered)
+        flow = {}
+        if ordered:
+            flow = {"orderflow": 1, "heat_source_rows": source_rows,
+                    "events": _trade_events([f.history.trades.slice_time(int(times[0])-1, clock() if live else t_end+dt-1)
+                                              for f in feeds], min_trade_size)}
         # Capture the cursor before sending: late trades can arrive while the socket
         # drains the initial grid/profiles and must still enter the next column.
-        trade_pos = [f.history.trades.pos_after(t_end) for f in feeds] if live else None
+        trade_pos = [f.history.trades.pos_after(clock() if ordered else t_end) for f in feeds] if live else None
         log.debug("grid %s %dx%d in %.1f ms", symbol, ncols, nrows, 1000 * (time.perf_counter() - t0))
         starts = [f.history.keyframe_times[0] for f in feeds if f.history.keyframe_times]
         await self.ws.send_bytes(pack({
@@ -566,14 +597,16 @@ class Client:
             "buy_vol": _round_list(bv), "buy_px": _round_list(bp, 2),
             "sell_vol": _round_list(sv), "sell_px": _round_list(sp, 2),
             "trades": levels,  # flat [col, tick, buy, sell, ...]: trades per price level
+            **flow,
             "last_trade": self.engine.last_trade(symbol, feeds),
             "server_time": clock(),
         }, grid))
-        await self._send_cob(view, symbol, feeds, tick_lo, nrows, row_ticks, outward, profile_ticks)
-        await self._send_svp(view, feeds, tick_lo, nrows, row_ticks, profile_ticks)
+        await self._send_cob(view, symbol, feeds, tick_lo, source_rows, row_ticks, outward, profile_ticks)
+        await self._send_svp(view, feeds, tick_lo, source_rows, row_ticks, profile_ticks)
         self.pusher = asyncio.create_task(
             self._push(view, symbol, feeds, dt, t_end if live else None,
-                       tick_lo, nrows, row_ticks, trade_pos, outward, min_trade_size, profile_ticks))
+                       tick_lo, nrows, row_ticks, trade_pos, outward, min_trade_size, profile_ticks,
+                       ordered, source_rows))
 
     async def _send_cob(self, view, symbol, feeds, tick_lo, nrows, row_ticks, outward=False, profile_ticks=0):
         geometry = {}
@@ -604,26 +637,53 @@ class Client:
                                       **geometry, "server_time": self.engine.data_now(feeds)}, values))
 
     async def _push(self, view, symbol, feeds, dt, t_last, tick_lo, nrows, row_ticks, trade_pos,
-                    outward=False, min_trade_size=0, profile_ticks=0):
+                    outward=False, min_trade_size=0, profile_ticks=0, ordered=False, source_rows=None):
         """One cancellable view task, with separate deadlines for profiles and heatmap.
         t_last=None freezes the heatmap in history mode; the profiles stay current."""
         clock = lambda: self.engine.data_now(feeds)  # noqa: E731
         next_svp = time.monotonic() + self.SVP_EVERY_MS / 1000
         next_cob = time.monotonic() + self.COB_EVERY_MS / 1000
+        next_flow = time.monotonic() + 0.05
+        source_rows = source_rows or nrows
         try:
             while True:
                 now = time.monotonic()
                 waits = [next_cob - now, next_svp - now]
                 if t_last is not None:
-                    waits.append((t_last + dt - clock()) / 1000)
+                    waits.append(next_flow-now if ordered else (t_last + dt - clock()) / 1000)
                 await asyncio.sleep(max(0.0, min(waits)))
                 now = time.monotonic()
                 if now >= next_cob:
                     next_cob = now + self.COB_EVERY_MS / 1000
-                    await self._send_cob(view, symbol, feeds, tick_lo, nrows, row_ticks, outward, profile_ticks)
+                    await self._send_cob(view, symbol, feeds, tick_lo, source_rows, row_ticks, outward, profile_ticks)
                 if now >= next_svp:
                     next_svp = now + self.SVP_EVERY_MS / 1000
-                    await self._send_svp(view, feeds, tick_lo, nrows, row_ticks, profile_ticks)
+                    await self._send_svp(view, feeds, tick_lo, source_rows, row_ticks, profile_ticks)
+                if ordered and t_last is not None:
+                    if now < next_flow:
+                        continue
+                    next_flow = now + 0.05
+                    end = clock() // dt * dt
+                    if end < t_last:  # latency estimator can move the data clock backwards
+                        continue
+                    times = np.arange(t_last, min(end, t_last+(MAX_COLS-1)*dt)+1, dt, dtype=np.int64)
+                    grid, bb, ba, bv, bp, sv, sp, _ = self.engine.grid(
+                        feeds, times+dt-1, dt, tick_lo, nrows, row_ticks, outward, min_trade_size, source_rows, True)
+                    recs = []
+                    for i, f in enumerate(feeds):
+                        stop = f.history.trades.pos_after(min(clock(),int(times[-1])+dt-1))
+                        recs.append(f.history.trades.since(trade_pos[i])[:max(0,stop-trade_pos[i])])
+                        trade_pos[i] = max(trade_pos[i],stop)
+                    await self.ws.send_bytes(pack({
+                        "type":"cols", "view":view, "times":times.tolist(), "replace":True,
+                        "bid":bb.tolist(), "ask":ba.tolist(),
+                        "buy_vol":_round_list(bv), "buy_px":_round_list(bp,2),
+                        "sell_vol":_round_list(sv), "sell_px":_round_list(sp,2),
+                        "events":_trade_events(recs,min_trade_size),
+                        "last_trade":self.engine.last_trade(symbol,feeds), "server_time":clock(),
+                    },grid))
+                    t_last = int(times[-1])
+                    continue
                 if t_last is None or clock() < t_last + dt:
                     continue
                 t_last = max(t_last + dt, clock() // dt * dt)  # skip ahead if we fell behind

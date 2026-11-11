@@ -83,6 +83,82 @@ async def trace(dt, historical=False, duration=3.1, trade_during_grid=False, **v
     return wire.messages
 
 
+class OrderedFlowTests(unittest.TestCase):
+    def test_ordered_row_budget_keeps_padding_without_changing_legacy_limit(self):
+        async def run():
+            for ordered, requested, expected in [(1,3220,3220),(1,100_000,8192),(0,3220,2000)]:
+                engine, feed = market()
+                engine.data_now = lambda _: START
+                wire = Wire(lambda: 0)
+                client = Client(engine,wire)
+                await client.handle_view(dict(view(50),orderflow=ordered,nrows=requested,
+                                              row_ticks=1,tick_lo=8500))
+                client.close()
+                h, data = wire.messages[0][1:]
+                self.assertEqual(h['nrows'],expected)
+                self.assertEqual(data.size,h['ncols']*expected)
+                self.assertEqual(float(data[-expected:].sum()),100)
+        asyncio.run(run())
+
+    def test_ordered_grid_keeps_same_timestamp_revisits_and_filters_individually(self):
+        async def run():
+            engine, feed = market()
+            for tick, qty, side in [(10001,10,1),(10002,5,-1),(10001,20,1),(10001,.05,1)]:
+                feed.on_trade(START-2, str(Decimal(tick)/100), qty, side)
+            engine.data_now = lambda _: START
+            wire = Wire(lambda: 0)
+            client = Client(engine,wire)
+            await client.handle_view(view(6, orderflow=1, min_trade_size=.1))
+            client.close()
+            h = wire.messages[0][1]
+            self.assertEqual(h['dt'],6)
+            self.assertEqual(h['events'][1::4],[10001,10002,10001])
+            self.assertEqual(h['events'][2::4],[10,5,20])
+            self.assertEqual(h['events'][::4],[START-2]*3)
+        asyncio.run(run())
+
+    def test_batched_columns_sample_their_own_book_and_deliver_late_trades_once(self):
+        messages = asyncio.run(trace(10,duration=.6,trade_during_grid=True,orderflow=1))
+        batches = [h for _,h,_ in messages if h['type']=='cols']
+        events = [v for h in batches for v in h['events']]
+        self.assertEqual(events[2::4],[2,7,3])
+        self.assertEqual(len(set(t for h in batches for t in h['times'])),61)
+        for _,h,data in messages:
+            if h['type']!='cols': continue
+            for i,t in enumerate(h['times']):
+                self.assertEqual(data[i*3+1],100 if t<START+350 else 140)
+
+    def test_reduced_grid_matches_price_descending_jvm_rows(self):
+        from deep_market.store import _rows
+        bids = np.arange(10,0,-1,dtype=np.float32)
+        for rows,expected in [(3,[27,18,10]),(4,[19,15,15,6]),(6,[10,17,7,11,7,3])]:
+            np.testing.assert_array_equal(_rows(bids,np.zeros(10),rows,1,10),expected)
+
+    def test_current_wide_column_refreshes_before_rollover(self):
+        messages=asyncio.run(trace(30_000,duration=.6,orderflow=1))
+        batches=[(h,data) for _,h,data in messages if h['type']=='cols']
+        self.assertGreater(len(batches),1)
+        self.assertTrue(all(h['times']==[START] and h['replace'] for h,_ in batches))
+        self.assertEqual(batches[0][1][1],100)
+        self.assertEqual(batches[-1][1][1],140)
+        self.assertEqual([q for h,_ in batches for q in h['events'][2::4]],[7,3])
+
+    def test_ordered_coarse_grid_uses_last_update_not_last_keyframe(self):
+        engine,feed=market()
+        feed.set_level(START+350,BID,'100.01',80)
+        result=engine.grid([feed],np.array([START-1,START+29999]),30000,9990,3,10,exact=True)
+        np.testing.assert_array_equal(result[0][:,1],[100,140])
+
+    def test_reduced_history_replays_updates_in_native_rows_before_compression(self):
+        engine,feed=market()
+        feed.reset_book(START,[(str(Decimal(10000+i)/100),str(10-i)) for i in range(10)], [('100.10','1')])
+        feed.set_level(START+10,BID,'100.00',100)
+        feed.set_level(START+20,BID,'100.01',0)
+        result=engine.grid([feed],np.array([START,START+10,START+20]),10,10000,3,1,
+                           source_rows=10,exact=True)
+        np.testing.assert_array_equal(result[0],[[27,18,10],[117,18,10],[108,18,10]])
+
+
 class SettingsTests(unittest.TestCase):
     def test_legacy_settings_convert_without_changing_render_factors(self):
         legacy = dict(dotSize=1.15, bubbleDensity=1.8, cutoff=0, dimming=0.27, units="base", tz="UTC")

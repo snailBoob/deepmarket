@@ -1,5 +1,6 @@
 // deepmarket front-end: live heatmap, bid/ask, trades, zoom and scroll-back for one coin.
 import { Heatmap, smoothingKernel } from "./heatmap.js";
+import { smartClusters, heatTransfer, appendTradeEvents, reducedRow, activeHeatBounds, heatPrecision, autoPriceRange, shouldRecenterPrice, profileVolumes, profileScale } from "./orderflow.js";
 
 // Show start-up failures (e.g. a shader that does not compile) on the page instead of
 // silently leaving it blank.
@@ -20,16 +21,12 @@ const TIME_AXIS_H = 24;
 const FONT = "300 14px 'Plex Mono', Menlo, 'DejaVu Sans Mono', monospace";
 const FONT_BOLD = "400 14px 'Plex Mono', Menlo, 'DejaVu Sans Mono', monospace";
 const FONT_NUM = "300 13px 'Plex Mono', Menlo, 'DejaVu Sans Mono', monospace";   // COB/SVP numbers
-const BASE_DT = 100;       // finest column duration (Binance sends the book every 100 ms)
-const MIN_COL_PX = 2;      // columns are at least this wide (CSS px)
-const MIN_ROW_PX = 2;      // below ~2px per level, levels are summed (only below visibility);
-                           // this also keeps the 2000-level grid covering the visible range
+const MIN_COL_PX = 1;
 const LABEL_STEP_PX = 22;  // price-axis labels; profile numbers have their own spacing
 const PROFILE_LABEL_PX = 16;
-const PROFILE_WIDTH_FRAC = 0.9; // leave 10% of the bar area free before the right divider
 const MAX_AHEAD = 6;
 const MARGIN_FRAC = 0.5;   // extra grid rows above and below the screen, as a fraction of it
-const MAX_ROWS = 2000;     // = server limit       // columns the live view may run ahead of the newest data
+const MAX_ROWS = 8192;     // ordered server limit, including off-screen padding
 const LINES_FROM_PX = 6;   // lines between price levels when levels are at least this tall
 // Time zones: fixed UTC offsets only (no summer/winter time), as the user asked.
 // IANA "Etc/GMT" zones have the sign reversed: UTC+1 is "Etc/GMT-1".
@@ -60,12 +57,11 @@ function normalizeSettings(data) {
   ]) {
     if (!(key in settings) && Number.isFinite(data[old])) settings[key] = (data[old] - offset) / scale;
   }
+  // Legacy negative power-curve contrast has no histogram-equalization equivalent.
+  if (Number.isFinite(settings.contrast)) settings.contrast = Math.max(0, Math.min(100, settings.contrast));
   return { ...DEFAULT_SETTINGS, ...settings };
 }
-const dotScale = () => 0.3 + 0.027 * S.set.volumeDotSize;
-const clusteringScale = () => 0.5 + 0.025 * S.set.clustering;
-// Time zoom levels in ms per CSS px. 50 = 100 ms columns of 2 px (the default).
-// Time zoom is continuous (ms per CSS px), like the price zoom. 50 = 100 ms columns of 2 px.
+// Continuous time zoom. One column per CSS pixel, bounded by the stored ms clock.
 const MS_PER_PX_MIN = 6.25;
 const MS_PER_PX_MAX = 15000;   // ~4 h across a wide screen
 const MS_PER_PX_DEFAULT = 50;
@@ -93,6 +89,7 @@ const S = {
   // What the user asked for:
   msPerPx: MS_PER_PX_DEFAULT,
   pxPerTick: 4,          // CSS px per native price tick (continuous)
+  priceMargin: 25,       // Bookmap Auto margin in selected price ticks
   gran: 1,               // price level size in native ticks, per coin
   live: true,
   tRight: 0,             // history mode: time at the right edge of the heat area
@@ -112,11 +109,13 @@ const S = {
   sellVol: null,
   sellPx: null,
   tr: null,              // per ring slot: flat [tick, buy, sell, ...] trades per price level
+  events: null,           // ordered [time, native tick, quantity, side] records
+  eventRevision: 0,
+  eventStart: 0,
   lastTrade: null,       // {t, tick, qty, side, streak}
   cob: null,             // current book, independent of heatmap time zoom: {data, bids, asks, bid, ask}
   svp: null,             // selected-price levels: {buy, sell, ticks, rowTicks}
   volRef: 0,             // bubble size reference in the selected display units
-  bubbleReference: null, // initial mean per instrument/filter, retained across live updates and zoom
   head: 0,               // ring slot of the oldest column
   valid: 0,
   tNewest: 0,
@@ -181,16 +180,60 @@ const dataNow = () => Date.now() + S.clockOffset;
 
 function timeGeometry() {
   const msPerPx = S.msPerPx;
-  if (msPerPx * MIN_COL_PX <= BASE_DT) return { dt: BASE_DT, colPx: BASE_DT / msPerPx, msPerPx };
-  return { dt: Math.round(msPerPx * MIN_COL_PX), colPx: MIN_COL_PX, msPerPx };
+  const dt = Math.max(1,Math.floor(msPerPx)); // stored event clock has millisecond resolution
+  return { dt, colPx: dt/msPerPx, msPerPx };
 }
 
-// Rows are whole price levels (gran native ticks); when a level gets thinner than
-// MIN_ROW_PX, several levels are summed per row.
+// Bookmap's 2H budget applies to VISIBLE rows. Off-screen padding gets the
+// same sampling density; shrink padding first when the texture budget is tight.
 function priceGeometry() {
   const G = S.gran;
-  const mult = NICE.find((k) => k * G * S.pxPerTick >= MIN_ROW_PX) || NICE[NICE.length - 1];
-  return { rowTicks: mult * G, rowPx: mult * G * S.pxPerTick };
+  const maxRows = Math.min(MAX_ROWS,heat.gl.getParameter(heat.gl.MAX_TEXTURE_SIZE));
+  const padding = Math.max(1,Math.min(1+2*MARGIN_FRAC,maxRows/Math.ceil(2*S.layout.heatH)));
+  const sourceRows = Math.min(2_000_000,Math.max(1,Math.ceil(S.layout.heatH/(G*S.pxPerTick)*padding)));
+  const rows = Math.min(sourceRows,maxRows,Math.ceil(2*S.layout.heatH*padding));
+  const rowTicks = sourceRows*G/rows;
+  return { rowTicks, rowPx:rowTicks*S.pxPerTick, sourceRows, rows };
+}
+
+function automaticPriceSamples() {
+  const v = S.view;
+  if (!v || !S.layout) return [];
+  const visible = Math.min(S.valid, Math.ceil(S.layout.heatW * (S.live ? S.set.nowFrac : 1) / v.colPx));
+  const samples = [];
+  for (let j = v.ncols - visible; j < v.ncols; j++) {
+    const slot = (S.head + j) % v.ncols;
+    const bid = S.bid[slot], ask = S.ask[slot];
+    samples.push(bid >= 0 && ask >= 0
+      ? [Math.floor(bid / S.gran), Math.ceil(ask / S.gran)] : []);
+  }
+  // qs falls back to trade prices only where a complete BBO is unavailable.
+  const missing = new Set(samples.flatMap((prices,i)=>prices.length ? [] : [i]));
+  if (missing.size && S.events) {
+    for (let i=0; i<S.events.length; i+=4) {
+      const j=visible-1-Math.floor((S.tNewest-S.events[i])/v.dt);
+      if (missing.has(j)) samples[j].push(Math.round(S.events[i+1]/S.gran));
+    }
+  }
+  return samples;
+}
+
+function fitAutomaticPrice(force = true) {
+  if (!S.autoCenter || !S.live) return false;
+  const samples = automaticPriceSamples();
+  if (!force && S.centerTick !== null) {
+    const rows = Math.round(S.layout.heatH/(S.pxPerTick*S.gran));
+    const upper = Math.round(S.centerTick/S.gran+(rows-1)/2);
+    if (!shouldRecenterPrice(samples.at(-1) || [], samples.slice(0,-1).flat(), upper, rows, S.priceMargin)) return false;
+  }
+  const range = autoPriceRange(samples, S.priceMargin);
+  if (!range) return false;
+  const ppt = S.layout.heatH / (range.rows * S.gran);
+  const center = (range.lower + range.upper) * S.gran / 2;
+  const changed = Math.abs(ppt - S.pxPerTick) > 1e-9 || S.centerTick === null || Math.abs(center - S.centerTick) > 1e-9;
+  S.pxPerTick = ppt;
+  S.centerTick = center;
+  return changed;
 }
 
 // Price level helpers (ticks are native exchange ticks).
@@ -255,6 +298,22 @@ function onBinary(buf) {
   if (Number.isFinite(h.server_time)) syncClock(h.server_time);
   if (h.type === "grid") onGrid(h, payload);
   else if (h.type === "col") onCol(h, payload);
+  else if (h.type === "cols" && S.view && h.view === S.view.id) {
+    for (let i=0;i<h.times.length;i++) {
+      onCol({type:'col',view:h.view,t:h.times[i],bid:h.bid[i],ask:h.ask[i],
+        replace:h.replace,
+        buy_vol:h.buy_vol[i],buy_px:h.buy_px[i],sell_vol:h.sell_vol[i],sell_px:h.sell_px[i],
+        last_trade:h.last_trade},payload.subarray(i*S.view.nrows,(i+1)*S.view.nrows));
+    }
+    if (S.events) {
+      for(const value of h.events) S.events.push(value);
+      const cutoff=S.tNewest-S.view.ncols*S.view.dt;
+      let start=0;
+      while(start<S.events.length && S.events[start]<=cutoff) start+=4;
+      if(start) { S.events.splice(0,start); S.eventStart+=start/4; }
+      S.eventRevision++;
+    }
+  }
   else if (h.type === "svp") {
     if (S.view && h.view === S.view.id) {
       const n = h.price_ticks ? h.price_ticks.length : S.view.nrows, data = new Float32Array(payload);
@@ -294,22 +353,21 @@ function requestView(reason = "view") {
   const nowX = S.live ? L.heatW * S.set.nowFrac : L.heatW;
   // Retain trades beyond the left edge while their merged bubble is still visible.
   // Include the live clock's permitted run-ahead, not just the current viewport.
-  const ncols = Math.ceil((nowX + BUBBLE_HISTORY_PX) / tg.colPx) + MAX_AHEAD + 1;
+  const ncols = Math.ceil(nowX / tg.colPx) + MAX_AHEAD + 1;
   // Extra rows above and below the visible part, so zooming out or scrolling vertically
   // shows data right away instead of an empty edge.
-  const visRows = Math.ceil(L.heatH / pg.rowPx);
-  const margin = Math.ceil(visRows * MARGIN_FRAC);
-  const nrows = Math.min(MAX_ROWS, visRows + 2 * margin);
+  const nrows = pg.rows;
   let tickLo = null;
-  if (!(S.live && S.autoCenter) && S.centerTick !== null) {
-    tickLo = Math.round(S.centerTick - ((nrows - 1) * pg.rowTicks) / 2);
+  if (S.centerTick !== null) {
+    tickLo = Math.round(S.centerTick - (nrows * pg.rowTicks - S.gran) / 2);
   }
   S.pendingView = true;
   const req = ++S.reqSeq;
   S.reqGeom.set(req, { colPx: tg.colPx, rowPx: pg.rowPx, msPerPx: tg.msPerPx, reason });
   S.lastRequest = performance.now();
   S.ws.send(JSON.stringify({
-    type: "view", req, symbol: S.symbol, dt: tg.dt, ncols, nrows, row_ticks: pg.rowTicks,
+    type: "view", req, symbol: S.symbol, dt: tg.dt, ncols, nrows, row_ticks: S.gran,
+    orderflow: 1, heat_source_rows: pg.sourceRows,
     tick_lo: tickLo, t_end: S.live ? null : Math.round(S.tRight),
     book_rounding: "outward", min_trade_size: S.set.minTradeSize, profile_row_ticks: S.gran,
   }));
@@ -319,24 +377,26 @@ function requestView(reason = "view") {
 function onGrid(h, payload) {
   if (h.symbol !== S.symbol) return;   // answer for a tab we already left
   // Pixel sizes belong to the zoom the grid was requested with.
-  const geom = S.reqGeom.get(h.req) || { colPx: MIN_COL_PX, rowPx: h.row_ticks * S.pxPerTick };
+  const rowTicks = h.row_ticks*(h.heat_source_rows || h.nrows)/h.nrows;
+  const geom = S.reqGeom.get(h.req) || { colPx: MIN_COL_PX, rowPx: rowTicks * S.pxPerTick };
   // Keep the existing preview until data for the current gesture arrives. Drawing
   // an obsolete coarse grid between finer previews makes dots disappear/reappear.
   if (h.req < S.reqSeq ||
       (geom.msPerPx && Math.abs(geom.msPerPx - S.msPerPx) > 1e-9) ||
-      Math.abs(geom.rowPx / h.row_ticks - S.pxPerTick) > 1e-9) {
+      (h.heat_source_rows !== undefined && Math.abs(geom.rowPx / rowTicks - S.pxPerTick) > 1e-9)) {
     S.reqGeom.delete(h.req);
     return;
   }
   for (const k of S.reqGeom.keys()) if (k <= h.req) S.reqGeom.delete(k);
   S.view = {
     id: h.view, dt: h.dt, ncols: h.ncols, nrows: h.nrows, tick_lo: h.tick_lo,
-    rowTicks: h.row_ticks, live: h.live, colPx: geom.colPx, rowPx: geom.rowPx,
+    rowTicks, sourceRows:h.heat_source_rows || h.nrows, sourceTicks:h.row_ticks,
+    ordered:h.orderflow === 1, live: h.live, colPx: h.dt/(geom.msPerPx || S.msPerPx), rowPx: rowTicks*S.pxPerTick,
     outward: h.book_rounding === "outward", minTradeSize: h.min_trade_size || 0,
     yOff: 0,               // CSS px: keeps the picture in place during a price zoom/pan
     // The grid is taller than the screen (margins above and below): shift it up so its
     // middle is at the middle of the heat area.
-    baseYOff: (S.layout.heatH - h.nrows * geom.rowPx) / 2,
+    baseYOff: (S.layout.heatH - h.nrows * rowTicks*S.pxPerTick) / 2,
     xOff: 0,               // CSS px: same for a time pan, until the new grid arrives
   };
   S.pendingView = h.req !== S.reqSeq;
@@ -354,6 +414,9 @@ function onGrid(h, payload) {
   S.sellPx = f32(h.sell_px);
   if (h.live) S.lastTrade = h.last_trade;
   S.tr = new Array(h.ncols).fill(null);
+  S.events = h.orderflow === 1 ? (h.events || []) : null;
+  S.eventStart=0;
+  S.eventRevision++;
   const T = h.trades || [];
   for (let i = 0; i < T.length; i += 4) {
     const c = T[i];
@@ -365,25 +428,37 @@ function onGrid(h, payload) {
   if (!h.live) S.tRight = h.t_end;
   // Keep a manually chosen centre across grid resolutions. Replacing it with
   // each snapped grid's midpoint accumulates half-row drift on zoom round trips.
-  if ((S.live && S.autoCenter) || S.centerTick === null) S.centerTick = tickOf(frameGeom(), S.layout.heatH / 2);
+  if (S.centerTick === null) S.centerTick = tickOf(frameGeom(), S.layout.heatH / 2);
+  if (S.autoCenter && S.live) S.view.yOff = S.layout.heatH / 2 - yOf(frameGeom(), S.centerTick);
   S.svp = null;
   S.cob = null;
-  heat.setGrid(h.ncols, h.nrows, S.data);
+  heat.setGrid(h.ncols, h.nrows, S.data, S.view.ordered ? heatBoundaries(S.view) : null);
   updateButtons();
-  if (autoZoomPrice(h)) requestView();
+  if (fitAutomaticPrice(geom.reason !== "recenter")) requestView("recenter");
 }
 
 function onCol(h, col) {
   const v = S.view;
-  if (!v || !v.live || h.view !== v.id || h.t <= S.tNewest) return;
+  if (!v || !v.live || h.view !== v.id || h.t < S.tNewest || (h.t===S.tNewest && !h.replace)) return;
+  if(h.t===S.tNewest) {
+    const slot=(S.head+v.ncols-1)%v.ncols;
+    S.data.set(col,slot*v.nrows);
+    S.bid[slot]=h.bid; S.ask[slot]=h.ask;
+    heat.setColumn(slot,col,heatBoundary(v,h.bid,h.ask));
+    S.buyVol[slot]=h.buy_vol; S.buyPx[slot]=h.buy_px ?? NaN;
+    S.sellVol[slot]=h.sell_vol; S.sellPx[slot]=h.sell_px ?? NaN;
+    if(h.last_trade) S.lastTrade=h.last_trade;
+    recenterIfNeeded(h);
+    return;
+  }
   const steps = Math.round((h.t - S.tNewest) / v.dt);
   if (steps > v.ncols) { requestView(); return; }
   for (let s = 0; s < steps; s++) {   // fill missed columns with the latest state
     const slot = S.head;
     S.data.set(col, slot * v.nrows);
-    heat.setColumn(slot, col);
     S.bid[slot] = h.bid;
     S.ask[slot] = h.ask;
+    heat.setColumn(slot, col, heatBoundary(v,h.bid,h.ask));
     const last = s === steps - 1;  // trades go into the newest column only
     S.buyVol[slot] = last ? h.buy_vol : 0;
     S.buyPx[slot] = last && h.buy_px !== null ? h.buy_px : NaN;
@@ -394,37 +469,35 @@ function onCol(h, col) {
   }
   S.tNewest = h.t;
   if (h.last_trade) S.lastTrade = h.last_trade;
-  // The picture stays still; only when the price is far from the middle (more than 30% of the
-  // screen height) is a centred grid fetched. (Continuous gliding was tried and made people
-  // seasick, 2026-10-24.)
-  if (S.autoCenter && !S.pendingView && !S.drag && h.bid >= 0 && h.ask >= 0) {
-    const g = frameGeom();
-    const off = (yOf(g, (h.bid + h.ask) / 2) - S.layout.heatH / 2) / S.layout.heatH;
-    if (Math.abs(off) > 0.3) requestView("recenter");
-  }
+  recenterIfNeeded(h);
+}
+
+function recenterIfNeeded(h) {
+  if (S.autoCenter && !S.pendingView && !S.drag && h.bid >= 0 && h.ask >= 0 &&
+      performance.now() - (S.lastRequest || 0) >= VIEW_EVERY_MS && fitAutomaticPrice(false)) requestView("recenter");
 }
 
 
 
-// Percentile cut-offs determine quantity bounds, not individual colour ranks.
-// Estimate the bounds from visible, smoothed cells on zoom,
-// recenter (when enabled), and at the configured live adjustment interval.
-// Log bins keep this linear-time; use their actual mean sizes rather than bin edges.
-const HIST_BINS = 512;
-const cutOf = () => S.set.lowerCutoff / 100;
-const hist = new Uint32Array(HIST_BINS);
-const histSizes = new Float64Array(HIST_BINS);
+// Rebuild the compressed histogram from visible filtered cells on adjustment.
 let scaleAt = -Infinity;
 let scaleValues = new Float32Array(0);
-let scaleColumn = new Float64Array(0);
-
-function heatQuantile(count, fraction) {
-  const target = Math.max(1, Math.ceil(count * fraction));
-  let acc = 0;
-  for (let b = 0; b < HIST_BINS; b++) {
-    acc += hist[b];
-    if (acc >= target) return Math.fround(histSizes[b] / hist[b]);
-  }
+function heatBoundary(v,bid,ask) {
+  const row=(tick,side)=>{
+    const source = Math.floor((tick-v.tick_lo+(side && v.outward ? v.sourceTicks-1 : 0))/v.sourceTicks);
+    if(source<0) return -1;
+    if(source>=v.sourceRows) return v.nrows;
+    return v.nrows-1-reducedRow(v.sourceRows-1-source,v.sourceRows,v.nrows);
+  };
+  return [bid<0 ? -1 : row(bid,false),ask<0 ? v.nrows : row(ask,true)];
+}
+function heatBoundaries(v) {
+  return Array.from({length:v.ncols},(_,i)=>heatBoundary(v,S.bid[i],S.ask[i]));
+}
+function heatOptions(v) {
+  return { quantum: Number(S.meta[S.symbol].step_size) || 1, usdt: usdt(),
+    p0: rowMid(v, 0) * S.meta[S.symbol].tick_size,
+    pstep: v.rowTicks * S.meta[S.symbol].tick_size };
 }
 
 function buildHeatScale(L, v, g, smoothing) {
@@ -433,51 +506,26 @@ function buildHeatScale(L, v, g, smoothing) {
   const [r0, r1] = visibleRows(L, v, g);
   const ncols = v.ncols, nrows = v.nrows;
   const j0 = Math.max(0, ncols - S.valid);
-  const usdtOn = usdt();
-  const { weights } = smoothing;
-  const radius = weights.length - 1;
+  const options = heatOptions(v);
+  const data = heat.prepare(smoothing, options);
   if (scaleValues.length < S.data.length) scaleValues = new Float32Array(S.data.length);
-  if (scaleColumn.length < nrows) scaleColumn = new Float64Array(nrows);
-  const p0 = rowMid(v, 0) * S.meta[S.symbol].tick_size;
-  const pstep = v.rowTicks * S.meta[S.symbol].tick_size;
-  let max = 0, count = 0;
+  let count = 0;
   for (let j = j0; j < ncols; j++) {
     const right = g.xr - (ncols - 1 - j) * v.colPx;
     const future = v.live && j === ncols - 1 && g.xr < L.heatW;
     if (!future && (right <= 0 || right - v.colPx >= L.heatW)) continue;
     const base = ((S.head + j) % ncols) * nrows;
-    for (let r = Math.max(0, r0 - radius); r <= Math.min(nrows - 1, r1 + radius); r++) {
-      scaleColumn[r] = S.data[base + r] * (usdtOn ? p0 + r * pstep : 1);
-    }
-    for (let r = r0; r <= r1; r++) {
+    const [activeLo,activeHi] = v.ordered ? activeHeatBounds(S.data.subarray(base,base+nrows)) : [0,nrows-1];
+    for (let r = Math.max(r0,activeLo); r <= Math.min(r1,activeHi); r++) {
       const top = rowTop(v, g, r);
       if (top >= L.heatH || top + v.rowPx <= 0) continue;
-      let sum = weights[0] * scaleColumn[r], total = weights[0];
-      for (let d = 1; d <= radius; d++) {
-        const w = weights[d];
-        if (r - d >= 0) { sum += w * scaleColumn[r - d]; total += w; }
-        if (r + d < nrows) { sum += w * scaleColumn[r + d]; total += w; }
-      }
-      const x = Math.fround(sum / total);
-      if (x > 0) { scaleValues[count++] = x; max = Math.max(max, x); }
+      scaleValues[count++] = data[base + r];
     }
   }
   if (!count) return;
-  const lmax = Math.log(max);
-  const k = (HIST_BINS - 1) / Math.log(1e6);
-  hist.fill(0); histSizes.fill(0);
-  for (let i = 0; i < count; i++) {
-    const x = scaleValues[i];
-    const b = Math.max(0, Math.min(HIST_BINS - 1, Math.floor((Math.log(x) - lmax) * k + HIST_BINS - 1)));
-    hist[b]++; histSizes[b] += x;
-  }
-  let lo = cutOf() > 0 ? heatQuantile(count, cutOf()) : 0;
-  let hi = heatQuantile(count, S.set.upperCutoff / 100);
-  // Repeated sizes can put both percentiles at one quantity. Use the actual
-  // maximum in that case; an entirely uniform book gets a zero-based scale.
-  if (hi <= lo) hi = max;
-  if (hi <= lo) lo = 0;
-  S.heatScale = { lo, hi };
+  S.heatScale = heatTransfer(scaleValues.subarray(0,count), { lower: S.set.lowerCutoff,
+    upper: S.set.upperCutoff, contrast: S.set.contrast, brightness: S.set.brightness,
+    quantum: options.quantum/(v.ordered ? heatPrecision(smoothing.sigma) : 1) });
 }
 
 // ---------- layout ----------------------------------------------------------------------
@@ -522,7 +570,7 @@ function frameGeom() {
 
 function xOf(g, t) { return g.xr + (t - S.tNewest) * g.pxPerMs; }
 function tOf(g, x) { return S.tNewest + (x - g.xr) / g.pxPerMs; }
-function rowHalf(v) { return v.outward ? v.rowTicks / 2 : 0.5; }
+function rowHalf(v) { return v.outward ? v.sourceTicks / 2 : 0.5; }
 function rowOf(v, tick) { return Math.floor((tick + rowHalf(v) - v.tick_lo) / v.rowTicks); }
 function yOf(g, tick) {    // outward rows are centred on their displayed price anchor
   const v = S.view;
@@ -549,8 +597,7 @@ function frame() {
   }
   const g = frameGeom();
   const tg = visibleTimes(L, g);
-  // Auto uses sigma 5 CSS pixels. Zoom changes the distance between discrete
-  // levels, not sigma; the shared weights are independent of devicePixelRatio.
+  // Auto uses sigma 5 CSS pixels below a 15px row height, otherwise no filter.
   const smoothing = smoothingKernel(v.rowPx, v.nrows, 5);
   // Measure the same smoothed quantities that the shader will colour.
   const nowMs = performance.now();
@@ -570,9 +617,9 @@ function frame() {
     nowX: g.nowX * dpr, colPx: v.colPx * dpr, rowPx: v.rowPx * dpr, shift: g.shift,
     head: S.head, valid: S.valid, future: v.live, fade: 1 - S.set.heatmapIntensity / 100,
     brightness: S.set.brightness / 100, contrast: S.set.contrast,
-    smoothing, scaleLo: S.heatScale.lo, scaleHi: S.heatScale.hi,
+    smoothing, transfer: S.heatScale, scaleLo: S.heatScale.lo, scaleHi: S.heatScale.hi,
     lines: v.rowPx >= 12,
-    usdt: usdt(), p0: rowMid(v, 0) * S.meta[S.symbol].tick_size, pstep: v.rowTicks * S.meta[S.symbol].tick_size,
+    ...heatOptions(v),
   });
 
   ctx.save();
@@ -737,7 +784,7 @@ function visibleRows(L, v, g) {
 
 
 // Middle tick of row r (used to turn sizes into USDT for that row).
-function rowMid(v, r) { return v.tick_lo + r * v.rowTicks + (v.outward ? 0 : (v.rowTicks - 1) / 2); }
+function rowMid(v, r) { return v.tick_lo + (r+0.5) * v.rowTicks - rowHalf(v); }
 
 function rowSide(v, r, bid, ask) {
   const lo = v.tick_lo + r * v.rowTicks;
@@ -794,58 +841,69 @@ function profileRows(v, g, source, firstOf, secondOf) {
   });
 }
 
-// Discrete selected levels shrink with zoom instead of being repeatedly summed
-// into 2–5px heatmap rows. Once subpixel, sample their Gaussian density at device
-// pixels. Wide levels stay rectangular; dense levels form a smooth wave.
-// The isolated QNT reference profiles support sigma ~5 CSS px. Use identical
-// positive weights for total and red segment, converting each source to USDT first.
-function barGroups(v, g, rows, rowTicks) {
-  const rowPx = rowTicks * g.ppt, pixel = 1 / S.layout.dpr;
-  const step = Math.max(rowPx, pixel), sigma = 5, reach = 4 * sigma;
-  let top = 0;
-  if (rowPx >= pixel) {
-    const offset = v.outward ? 0 : (rowTicks - 1) / 2;
-    const tick = Math.ceil((tickOf(g, 0) - offset) / rowTicks) * rowTicks + offset;
-    top = yOf(g, tick) - rowPx / 2;
-  }
-  const list = Array.from({ length: Math.max(0, Math.ceil((S.layout.heatH - top) / step)) }, (_, i) =>
-    ({ top: top + i * step, bottom: top + (i + 1) * step, val: 0, second: 0 }));
+const profileStates = new Map();
+
+// nD/nv use native-price arrays, separate from compressed heat rows. Missing
+// levels are zeros; numbers and hover retain the unfiltered wire quantities.
+function barGroups(v, g, rows, source, column) {
+  const rowTicks = source.rowTicks || v.rowTicks, rowPx = rowTicks*g.ppt;
+  const offset = v.outward ? 0 : (rowTicks-1)/2;
+  const lo = Math.floor((tickOf(g,S.layout.heatH)-offset)/rowTicks+.5+1e-9)*rowTicks+offset;
+  const hi = Math.ceil((tickOf(g,0)-offset)/rowTicks-.5-1e-9)*rowTicks+offset;
+  const count = Math.max(1,Math.round((hi-lo)/rowTicks)+1);
+  const quantum = Number(S.meta[S.symbol].step_size) || 1;
+  const book = column === 'cob';
+  // COB's native lazy column uses tC.p; nv applies tC.o to native SVP arrays.
+  // With zoom-out optimization, o's sigma uses at most 2H heat rows.
+  const filterRows = book ? count : Math.min(count,2*S.layout.heatH);
+  const sigma = smoothingKernel(S.layout.heatH/filterRows,count).sigma;
+  const unitPrice = usdt() ? Math.max(1,S.lastTrade?.tick || 1)*S.meta[S.symbol].tick_size : 1;
+  const scaleKey = `${S.symbol}:${S.gran}:${S.set.units}:${quantum}`;
+  const key = `${scaleKey}:${lo}:${count}:${rowPx}:${g.dy}:${S.layout.heatH}:${sigma}:${unitPrice}`;
+  const state = profileStates.get(column);
+  if (state?.source === source && state.key === key) return state.groups;
+  const first = new Float64Array(count), second = new Float64Array(count);
   for (const row of rows) {
-    const total = sizeValue(row.first + row.second, row.tick);
-    if (total <= 0) continue;
-    const second = sizeValue(row.second, row.tick);
-    const first = Math.max(0, Math.ceil((row.y - reach - top) / step - 0.5));
-    const last = Math.min(list.length - 1, Math.floor((row.y + reach - top) / step - 0.5));
-    for (let i = first; i <= last; i++) {
-      const weight = Math.exp(-0.5 * ((top + (i + 0.5) * step - row.y) / sigma) ** 2);
-      list[i].val += weight * total;
-      list[i].second += weight * second;
-    }
+    const i = Math.round((row.tick-lo)/rowTicks);
+    if (i<0 || i>=count) continue;
+    first[i] += Math.round(row.first/quantum);
+    second[i] += Math.round(row.second/quantum);
   }
-  return { list };
+  const bid = Math.floor((source.bid-lo+offset)/rowTicks+1e-9);
+  const ask = v.outward ? Math.ceil((source.ask-lo)/rowTicks-1e-9)
+    : Math.floor((source.ask-lo+offset)/rowTicks+1e-9);
+  // Legacy compressed rows have already lost the native BBO split. Retain
+  // their transmitted sides rather than recolouring a mixed row by its anchor.
+  const mixedLegacy = book && rowTicks>S.gran && first.some((v,i)=>v>0 && second[i]>0);
+  const filtered = mixedLegacy ? {first,second} : profileVolumes(first,second,{sigma,book,bid,ask});
+  let maximum = 0;
+  const list = Array.from({length:count},(_,i)=>{
+    const tick = lo+i*rowTicks, y = yOf(g,tick);
+    const val = sizeValue((filtered.first[i]+filtered.second[i])*quantum,tick);
+    const red = sizeValue(filtered.second[i]*quantum,tick);
+    maximum = Math.max(maximum,val/(quantum*unitPrice));
+    return {top:y-rowPx/2,bottom:y+rowPx/2,val,second:red};
+  });
+  const scale = profileScale(maximum,state?.scaleKey === scaleKey ? state.scale : 5);
+  const groups = {list,scale:scale*quantum*unitPrice,sigma,lo,rowTicks,first:filtered.first,second:filtered.second};
+  profileStates.set(column,{source,key,scaleKey,scale,groups});
+  return groups;
 }
 
 function drawBars(groups, x0, widthOf, color) {
   ctx.fillStyle = color;
   const dpr = S.layout.dpr;
-  // Whole device-pixel boundaries prevent dark seams between adjacent thin bars.
+  // Whole device-pixel boundaries prevent seams. Like Dz's inclusive row
+  // height, retain at least one pixel for an isolated subpixel price level.
   for (const gr of groups.list) {
     const w = widthOf(gr);
-    const top = Math.round(gr.top * dpr) / dpr, bottom = Math.round(gr.bottom * dpr) / dpr;
+    let top = Math.round(gr.top*dpr)/dpr, bottom = Math.round(gr.bottom*dpr)/dpr;
+    if(bottom<=top) {
+      top=Math.floor((gr.top+gr.bottom)*.5*dpr)/dpr;
+      bottom=top+1/dpr;
+    }
     if (w > 0 && bottom > top) ctx.fillRect(x0, top, w, bottom - top);
   }
-}
-
-// Each profile has its own linear scale. Heatmap contrast, past liquidity and
-// fully off-screen rows must not change the proportions of the current bars.
-function barMax(height, ...groups) {
-  let max = 0;
-  for (const { list } of groups) {
-    for (const gr of list) {
-      if (gr.bottom > 0 && gr.top < height) max = Math.max(max, gr.val);
-    }
-  }
-  return max;
 }
 
 function drawSideColumns(L, v, g) {
@@ -872,23 +930,21 @@ function drawSideColumns(L, v, g) {
   const cob = cobSource(v);
   if (cob) {
     const rows = profileRows(v, g, cob, (r) => cob.data[r] - cobAsk(v, cob, r), (r) => cobAsk(v, cob, r));
-    const tot = barGroups(v, g, rows, cob.rowTicks || v.rowTicks);
-    const max = barMax(L.heatH, tot);
-    const width = (gr) => max > 0 ? gr.val / max * (COB_W - 2) * PROFILE_WIDTH_FRAC : 0;
+    const tot = barGroups(v, g, rows, cob, 'cob');
+    const width = (gr) => Math.min(1,gr.val/tot.scale)*(COB_W-2);
     // Shared rows retain both colours: red on the left, green after it, as in SVP.
     drawBars(tot, xc + 1, width, COB_BID);
     drawBars(tot, xc + 1, (gr) => width({ val: gr.second }), COB_ASK);
     drawProfileNumbers(rows, xc + 3);
   }
 
-  // SVP: its own scale from total session volume. Applying the SAME linear scale
-  // to the red segment preserves the actual sell/buy split (also for USDT).
+  // SVP: its own scale from filtered session volume. Both filtered sides share
+  // that linear scale, including after conversion to USDT.
   const svp = S.svp;
   if (svp) {
     const rows = profileRows(v, g, svp, (r) => svp.buy[r], (r) => svp.sell[r]);
-    const tot = barGroups(v, g, rows, svp.rowTicks);
-    const max = barMax(L.heatH, tot);
-    const width = (gr) => max > 0 ? gr.val / max * (SVP_W - 2) * PROFILE_WIDTH_FRAC : 0;
+    const tot = barGroups(v, g, rows, svp, 'svp');
+    const width = (gr) => Math.min(1,gr.val/tot.scale)*(SVP_W-2);
     drawBars(tot, xs + 1, width, COB_BID);
     drawBars(tot, xs + 1, (gr) => width({ val: gr.second }), COB_ASK);
     drawProfileNumbers(rows, xs + 3);
@@ -945,7 +1001,7 @@ function bucketSpan(v, minPx) {
 }
 const VOL_BUCKET_PX = 15;  // volume bars approximately 15 px wide
 const VOL_BAR_FILL = 0.85; // with a small gap between bars
-const BUBBLE_MIN_DRAW_R = 3; // smaller bubbles are not drawn (their volume still counts in merges)
+const BUBBLE_MIN_DRAW_R = 3; // Bookmap's minimum diameter is six CSS pixels
 const VOL_H = 60;          // volume histogram height (CSS px)
 
 // Group columns into time buckets aligned to absolute time, so they do not jump while scrolling.
@@ -971,7 +1027,7 @@ function tradeBuckets(v, g) {
   return out;
 }
 
-// Delta bubbles: keep both sides through every grouping/merge. Colour and area
+// Legacy aggregate packets: keep both sides through every grouping/merge. Colour and volume
 // represent buy minus sell, but placement uses total volume so cancellation cannot
 // put a bubble outside its trades (or divide by zero). A balanced cluster is kept
 // for further merging but draws no sphere.
@@ -994,11 +1050,18 @@ function bubbleVolume(c) { return sizeValue(Math.abs(c.delta), c.tick); }
 // must not perturb distances or tie-breaking between unchanged trades.
 const BUBBLE_TIME_ORIGIN = Date.now();
 function bubbleXOffset(g) {
-  return g.xr - (S.tNewest - BUBBLE_TIME_ORIGIN) * g.pxPerMs;
+  const origin=S.events ? Math.floor(BUBBLE_TIME_ORIGIN/S.view.dt)*S.view.dt : BUBBLE_TIME_ORIGIN;
+  return g.xr - (S.tNewest - origin) * g.pxPerMs;
 }
 
-function tradeClusters(v, g) {
-  // Start at screen-pixel resolution, then let Smart overlap merging do the
+function tradeClusters(v, g, afterTime = -Infinity) {
+  if(S.events) {
+    const quantum=Number(S.meta[S.symbol].step_size)||1;
+    return appendTradeEvents([],orderedTradeEvents(v),{clustering:S.set.clustering,ppt:g.ppt})
+      .map(p=>({...p,x:p.x*v.dt*g.pxPerMs,buy:p.buy*quantum,sell:p.sell*quantum,
+        weight:p.weight*quantum,vol:p.weight*quantum}));
+  }
+  // Start at screen-pixel resolution, then let Smart's pair-score queue do the
   // clustering. Source records retain native prices but are time-aggregated into
   // heat columns; never invent sub-column timing. Absolute anchors avoid pan jitter.
   const n = v.ncols;
@@ -1013,6 +1076,7 @@ function tradeClusters(v, g) {
     const lv = S.tr[slot];  // flat [tick, buy, sell, ...]: trades per price level
     if (!lv) continue;
     const time = S.tNewest - (n - 1 - j) * v.dt;
+    if (time <= afterTime) continue;
     const xc = (time - BUBBLE_TIME_ORIGIN - v.dt / 2) * g.pxPerMs;
     const bucket = Math.floor((S.tNewest - (n - 1 - j) * v.dt - 1) / span);
     for (let i = 0; i < lv.length; i += 3) {
@@ -1036,113 +1100,34 @@ function tradeClusters(v, g) {
   return out;
 }
 
-function updateVolRef(clusters, xOffset = 0) {
-  // Calibrate once from the first non-empty tape, not from each moving viewport.
-  // Otherwise an unrelated new trade (or a zoom/grid replacement) resizes every
-  // old dot and even changes its overlap partners. Keep both unit references from
-  // that same sample so switching coins/USDT and back is reversible.
-  const minTradeSize = S.view.minTradeSize;
-  let ref = S.bubbleReference;
-  if (!ref || ref.symbol !== S.symbol || ref.minTradeSize !== minTradeSize) {
-    const visible = clusters.filter((c) => c.delta !== 0 && c.x + xOffset >= 0);
-    // The off-screen overlap margin must not change the initial visible scale.
-    const nonzero = visible.length ? visible : clusters.filter((c) => c.delta !== 0);
-    if (!nonzero.length) { S.bubbleReference = null; S.volRef = 0; return; }
-    const tickSize = S.meta[S.symbol].tick_size;
-    ref = S.bubbleReference = {
-      symbol: S.symbol, minTradeSize,
-      base: nonzero.reduce((sum, c) => sum + Math.abs(c.delta), 0) / nonzero.length,
-      quote: nonzero.reduce((sum, c) => sum + Math.abs(c.delta) * c.tick * tickSize, 0) / nonzero.length,
-    };
+function orderedTradeEvents(v,afterIndex=0) {
+  const events=[],quantum=Number(S.meta[S.symbol].step_size)||1;
+  for(let i=Math.max(0,afterIndex-S.eventStart)*4;i<S.events.length;i+=4) {
+    const t=S.events[i],tick=S.events[i+1],qty=S.events[i+2],side=S.events[i+3];
+    // Quantize time only, never price bands. Preserve each visit to a native tick.
+    events.push({x:Math.floor(t/v.dt)-Math.floor(BUBBLE_TIME_ORIGIN/v.dt),tick,
+      buy:side>0 ? Math.round(qty/quantum) : 0,
+      sell:side<0 ? Math.round(qty/quantum) : 0});
   }
-  S.volRef = usdt() ? ref.quote : ref.base;
+  return events;
 }
 
-// Area follows absolute delta relative to the average pre-merge dot. The pixel
-// radius is calibrated empirically.
-const BUBBLE_MIN_R = 1.5;
-const BUBBLE_REF_R = 6;
-const BUBBLE_MAX_R = 20;
-// Two maximum overlap distances at Size 100 / Clustering 100. This context stays
-// outside the canvas clip and survives ring eviction until edge dots have left.
-const BUBBLE_HISTORY_PX = 400;
-function bubbleRadius(vol) {
-  if (!(vol > 0)) return 0;
-  const ref = S.volRef || vol;
-  const k = dotScale();
-  return Math.min(BUBBLE_MAX_R * k, Math.max(BUBBLE_MIN_R, BUBBLE_REF_R * k * Math.sqrt(vol / ref)));
-}
-
-// Overlapping clusters combine both sides, then recalculate the delta. The radius
-// may shrink and the colour may flip; gross buy/sell volume is never discarded.
-// Merge candidates are processed in deterministic overlap passes.
-const BUBBLE_OVERLAP = 1 / 1.8; // touching spheres merge at clustering setting 52
+// Input is the current chart's tape. Smart normalization is recalculated from
+// the largest active cluster, so new trades and viewport changes can resize dots.
 function mergeOverlapping(list, g, xOffset = 0) {
-  // Growing/moving a merged dot can make two previously separate hosts overlap.
-  // Repeat until stable; each non-final pass removes at least one cluster.
-  while (true) {
-    list.sort((a, b) => bubbleVolume(b) - bubbleVolume(a) || a.x - b.x || a.tick - b.tick || b.buy - a.buy);
-    const kept = [];
-    // Spatial hash: only bubbles in neighbouring cells can overlap.
-    const overlap = BUBBLE_OVERLAP * clusteringScale();
-    const cell = 2 * overlap * BUBBLE_MAX_R * dotScale();
-    const cells = new Map();
-    const cellKey = (cx, cy) => `${cx}:${cy}`;
-    for (const p of list) {
-      p.y = p.tick * g.ppt;
-      p.r = bubbleRadius(bubbleVolume(p));
-      const cx = Math.floor(p.x / cell);
-      const cy = Math.floor(p.y / cell);
-      let host = null, nearest = Infinity;
-      for (let ix = cx - 1; ix <= cx + 1; ix++) {
-        for (let iy = cy - 1; iy <= cy + 1; iy++) {
-          const bucket = cells.get(cellKey(ix, iy));
-          if (!bucket) continue;
-          for (const k of bucket) {
-            const dx = k.x - p.x;
-            const dy = k.y - p.y;
-            const lim = overlap * (k.r + p.r);
-            const distance = dx * dx + dy * dy;
-            if (distance < lim * lim && (distance < nearest ||
-                (distance === nearest && (k.x < host.x || (k.x === host.x && k.tick < host.tick))))) {
-              host = k; nearest = distance;
-            }
-          }
-        }
-      }
-      if (!host) {
-        kept.push(p);
-        const key = cellKey(cx, cy);
-        (cells.get(key) || cells.set(key, []).get(key)).push(p);
-        continue;
-      }
-      const oldKey = cellKey(Math.floor(host.x / cell), Math.floor(host.y / cell));
-      host.buy += p.buy; host.sell += p.sell;
-      host.xw += p.xw; host.pxw += p.pxw;
-      updateCluster(host);
-      host.y = host.tick * g.ppt;
-      host.r = bubbleRadius(bubbleVolume(host));
-      const newKey = cellKey(Math.floor(host.x / cell), Math.floor(host.y / cell));
-      // Weighted placement can move the host across a cell boundary. Keep its
-      // lookup position current so later dots find it regardless of screen offset.
-      if (newKey !== oldKey) {
-        const bucket = cells.get(oldKey);
-        bucket.splice(bucket.indexOf(host), 1);
-        if (!bucket.length) cells.delete(oldKey);
-        (cells.get(newKey) || cells.set(newKey, []).get(newKey)).push(host);
-      }
-    }
-    if (kept.length === list.length) {
-      // Projection happens only after merging, so subpixel scroll/recentering
-      // cannot change which of two equally near bubbles receives a trade.
-      for (const p of kept) {
-        p.x += xOffset;
-        p.y = yOf(g, p.tick);
-      }
-      return kept;
-    }
-    list = kept;
-  }
+  const quantum = Number(S.meta[S.symbol].step_size) || 1;
+  // The reference removes off-screen prices before normalization/clustering.
+  const visible = list.filter(p => { const y = yOf(g,p.tick); return y >= 0 && y <= S.layout.heatH; });
+  const input = visible.map(p => ({ x: Math.round(p.x), y: p.tick * g.ppt, tick: p.tick,
+    buy: Math.round(p.buy / quantum), sell: Math.round(p.sell / quantum),
+    weight:Math.round((p.weight ?? p.vol ?? p.buy+p.sell)/quantum) }));
+  const { clusters } = smartClusters(input, { size: S.set.volumeDotSize, clustering: S.set.clustering,
+    volume: p => sizeValue(Math.abs(p.buy - p.sell), p.tick) });
+  const result = clusters.map(p => ({ tick:p.tick, x: p.x + xOffset, y: yOf(g, p.tick),
+    buy: p.buy * quantum, sell: p.sell * quantum, vol: p.weight * quantum, weight:p.weight*quantum,
+    delta: (p.buy - p.sell) * quantum, side: Math.sign(p.buy - p.sell), r: p.radius }));
+  S.volRef = result.reduce((max,p) => Math.max(max,bubbleVolume(p)),0);
+  return result;
 }
 
 // Pre-rendered shaded spheres, one per side and half-pixel radius (much cheaper than a
@@ -1183,24 +1168,48 @@ const SPHERE = {
   [-1]: ["#e85648", "#e25143", "#a23a31", "#261214"],
 };
 
+let bubbleCache;
 function drawBubbles(v, g) {
-  const clusters = tradeClusters(v, g);
-  const xOffset = bubbleXOffset(g);
-  updateVolRef(clusters, xOffset);
-  const list = mergeOverlapping(clusters, g, xOffset);
-  list.sort((a, b) => a.r - b.r); // small first, so the biggest delta bubble is on top
+  const key = [S.symbol,g.pxPerMs,g.ppt,g.dy,g.dx,S.layout.heatH,S.set.volumeDotSize,S.set.clustering,S.set.units].join(':');
+  const reuse = bubbleCache && bubbleCache.view === v && bubbleCache.trades === S.tr && bubbleCache.key === key;
+  if (!reuse || bubbleCache.newest !== S.tNewest || bubbleCache.revision !== S.eventRevision) {
+    // Live updates extend the already-clustered tape. Rebuilding from raw trades
+    // here would split old clusters whenever a new large trade lowers the scale.
+    const previous = reuse ? bubbleCache.tape.filter(p => p.x + bubbleXOffset(g) >= 0) : [];
+    let input;
+    if(S.events) {
+      // Smart works in integer time columns. Keep its live tape in that coordinate
+      // system, independent of the viewport's current scroll offset.
+      const px = v.dt*g.pxPerMs;
+      const quantum=Number(S.meta[S.symbol].step_size)||1;
+      const tape = previous.map(p=>({...p,x:Math.round(p.x/px),weight:Math.round(p.weight/quantum),
+        buy:Math.round(p.buy/quantum),sell:Math.round(p.sell/quantum)}));
+      const incoming=orderedTradeEvents(v,reuse ? bubbleCache.eventNext : 0);
+      input=appendTradeEvents(tape,incoming,{clustering:S.set.clustering,ppt:g.ppt/px})
+        .map(p=>({...p,x:p.x*px,buy:p.buy*quantum,sell:p.sell*quantum,weight:p.weight*quantum}));
+    } else {
+      input=[...previous,...tradeClusters(v,g,reuse ? bubbleCache.newest : -Infinity)];
+    }
+    const list = mergeOverlapping(input, g);
+    const tape=[...list].sort((a,b)=>a.x-b.x);
+    list.sort((a,b) => a.r-b.r);
+    bubbleCache = {view:v,trades:S.tr,key,list,newest:S.tNewest,ref:S.volRef,
+      tape,eventNext:S.eventStart+(S.events?.length || 0)/4,revision:S.eventRevision};
+  }
+  S.volRef = bubbleCache.ref;
+  const list = bubbleCache.list, xOffset = bubbleXOffset(g);
   const dpr = S.layout.dpr;
   ctx.globalAlpha = 1 - S.set.transparency / 100;
   for (const p of list) {
     // Clip only complete clusters: an off-screen trade can belong to a sphere
     // whose centre or right edge is still visible. Leave one pixel for rounding.
-    if (p.x + p.r + 1 <= 0) continue;
+    if (p.x + xOffset + p.r + 1 <= 0) continue;
     // Filtering follows ALL clustering/merging. Hidden dots still contribute
     // both sides and weighted placement; histogram and SVP remain unfiltered.
     if (p.r < BUBBLE_MIN_DRAW_R || Math.abs(p.delta) + Number.EPSILON * p.vol < S.set.minVolume) continue;
     const spr = sphereSprite(p.side, p.r, dpr);
     const h = spr.cssSize / 2;
-    ctx.drawImage(spr, Math.round(p.x - h), Math.round(p.y - h), spr.cssSize, spr.cssSize);
+    ctx.drawImage(spr, Math.round(p.x + xOffset - h), Math.round(yOf(g,p.tick) - h), spr.cssSize, spr.cssSize);
   }
   ctx.globalAlpha = 1;
 }
@@ -1299,9 +1308,20 @@ function localXY(e) {
 }
 
 function zoomPrice(factor) {
-  S.pxPerTick = Math.min(20, Math.max(0.002, S.pxPerTick * factor));
+  setPriceZoom(factor, S.pxPerTick, S.priceMargin);
   rescaleViewY();
   scheduleView();
+}
+
+function setPriceZoom(factor, ppt, margin) {
+  if (S.autoCenter && S.live) {
+    S.priceMargin = Math.max(3, Math.min(4000, margin / factor));
+    fitAutomaticPrice();
+  } else {
+    // qs NONE mode: 6..8000 selected price rows, independent of screen/DPR.
+    const rows = Math.max(6, Math.min(8000, S.layout.heatH / (ppt * factor * S.gran)));
+    S.pxPerTick = S.layout.heatH / (rows * S.gran);
+  }
 }
 
 // Make the current grid follow a price zoom immediately (until the new grid arrives).
@@ -1390,7 +1410,7 @@ ov.addEventListener("mousedown", (e) => {
   if (y >= S.layout.heatH) return;
   if (S.drag && S.drag.wheel) return;
   const kind = nearNowLine(x, y) ? "now" : inPriceAxis(x, y) ? "price" : "pan";
-  S.drag = { kind, x0: x, y0: y, dx: 0, dy: 0, ppt0: S.pxPerTick };
+  S.drag = { kind, x0: x, y0: y, dx: 0, dy: 0, ppt0: S.pxPerTick, margin0: S.priceMargin };
   e.preventDefault();
 });
 
@@ -1412,7 +1432,7 @@ window.addEventListener("mousemove", (e) => {
     S.set.nowFrac = Math.min(0.95, Math.max(0.3, p.x / S.layout.heatW));
   } else if (d.kind === "price") {
     // Drag up to zoom in on the price axis.
-    S.pxPerTick = Math.min(20, Math.max(0.002, d.ppt0 * Math.exp((d.y0 - p.y) / 120)));
+    setPriceZoom(Math.exp((d.y0 - p.y) / 120), d.ppt0, d.margin0);
     rescaleViewY();
     scheduleView(150);
   } else {
@@ -1476,6 +1496,7 @@ function goBack() {
 function goLive() {
   S.live = true;
   S.autoCenter = true;
+  fitAutomaticPrice();
   requestView("recenter");
 }
 
@@ -1545,13 +1566,12 @@ function renderTabs() {
 }
 
 function selectTab(inst) {
-  if (S.symbol) zoomByTab.set(S.symbol, { msPerPx: S.msPerPx, pxPerTick: S.pxPerTick });
+  if (S.symbol) zoomByTab.set(S.symbol, { msPerPx: S.msPerPx, pxPerTick: S.pxPerTick, priceMargin: S.priceMargin });
   S.symbol = inst;
-  S.bubbleReference = null;
   const z = zoomByTab.get(inst);
   S.msPerPx = z ? z.msPerPx : MS_PER_PX_DEFAULT;
   S.pxPerTick = z ? z.pxPerTick : 4;
-  S.autoZoom = !z;        // first view of this tab: pick a sensible price zoom
+  S.priceMargin = z?.priceMargin ?? 25;
   S.gran = S.meta[inst].gran;
   S.view = null;
   S.data = null;
@@ -1571,18 +1591,6 @@ async function closeTab(inst) {
   if (!r.ok) alert((await r.json().catch(() => ({}))).error || "Closing failed");
   // onMeta updates the selection and view together, regardless of whether the
   // broadcast arrives before or after this HTTP response.
-}
-
-// First view of a tab: zoom the price axis so roughly 3% of the price fits on screen.
-function autoZoomPrice(h) {
-  if (!S.autoZoom || !S.layout || h.bid.length === 0) return false;
-  S.autoZoom = false;
-  const bid = h.bid[h.bid.length - 1];
-  if (!(bid > 0)) return false;
-  const want = Math.min(20, Math.max(0.002, S.layout.heatH / (0.03 * bid)));
-  if (want / S.pxPerTick < 1.5 && S.pxPerTick / want < 1.5) return false;
-  S.pxPerTick = want;
-  return true;
 }
 
 // ---------- instrument subscription dialog --------------------------------------------
@@ -1938,6 +1946,7 @@ function changeSetting(key, value) {
     }
     scaleAt = -Infinity;
   }
+  if (key === "brightness" || key === "contrast") scaleAt = -Infinity;
   if (key === "minTradeSize") scheduleView();
   syncSettingsControls();
   saveSettings(part);

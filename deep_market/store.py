@@ -156,9 +156,16 @@ def _levels(col, tr):
     return uniq >> 32, (uniq & ((1 << 32) - 1)) + tick.min(), buy, sell
 
 
-def _rows(bid, ask, nrows, row_ticks):
+def _rows(bid, ask, nrows, row_ticks, source_rows=None):
     row = bid + ask
-    return row.reshape(nrows, row_ticks).sum(1) if row_ticks > 1 else row
+    source_rows = source_rows or nrows
+    row = row.reshape(source_rows, row_ticks).sum(1) if row_ticks > 1 else row
+    if source_rows == nrows:
+        return row
+    # Bookmap tF: price-descending indices, truncated 32-bit fixed-point ratio.
+    ratio = (nrows << 32) // source_rows
+    indices = nrows - 1 - ((np.arange(source_rows - 1, -1, -1, dtype=np.int64) * ratio) >> 32)
+    return np.bincount(indices, weights=row, minlength=nrows).astype(np.float32)
 
 
 def _best_in_range(bid, ask, tick_lo, ask_shift=0):
@@ -299,7 +306,7 @@ class BookHistory:
                 sides[side].pop(tick, None)
         return bids, asks
 
-    def sample_grid(self, times, tick_lo, nrows, row_ticks=1, outward=False):
+    def sample_grid(self, times, tick_lo, nrows, row_ticks=1, outward=False, source_rows=None, exact=False):
         """Sample the book at each time in `times` (sorted int64 ms). Row r covers ticks
         tick_lo + r*row_ticks .. + row_ticks-1. With outward rounding, asks cover
         anchor-row_ticks+1 .. anchor instead: bids floor, asks ceil.
@@ -312,7 +319,8 @@ class BookHistory:
         chunk by chunk, so a 2-hour request does not copy the whole log."""
         times = np.asarray(times, dtype=np.int64)
         ncols = len(times)
-        span = nrows * row_ticks
+        source_rows = source_rows or nrows
+        span = source_rows * row_ticks
         ask_shift = row_ticks - 1 if outward else 0
         grid = np.zeros((ncols, nrows), np.float32)
         best_bid = np.full(ncols, -1, np.int64)
@@ -323,7 +331,7 @@ class BookHistory:
         if first >= ncols:
             return grid, best_bid, best_ask
         dt = int(times[1] - times[0]) if ncols > 1 else 0
-        if dt >= self.keyframe_ms:
+        if dt >= self.keyframe_ms and source_rows == nrows and not exact:
             self._grid_from_keyframes(times, first, tick_lo, nrows, row_ticks, grid, best_bid, best_ask, ask_shift)
             return grid, best_bid, best_ask
         t0 = int(times[first])
@@ -349,7 +357,7 @@ class BookHistory:
                 bb, ba = _best_in_range(bid, ask, tick_lo, ask_shift)
                 state["bb"], state["ba"] = bb, ba
                 state["dirty"] = False
-            grid[nxt:upto] = _rows(bid, ask, nrows, row_ticks)
+            grid[nxt:upto] = _rows(bid, ask, nrows, row_ticks, source_rows)
             best_bid[nxt:upto] = state["bb"]
             best_ask[nxt:upto] = state["ba"]
             state["next"] = upto

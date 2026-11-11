@@ -1,6 +1,6 @@
 services:
   deepmarket:
-    image: ${DEEP_MARKET_IMAGE:-ghcr.io/snailboob/deepmarket:v1.1.2}
+    image: ${DEEP_MARKET_IMAGE:-ghcr.io/snailboob/deepmarket:v1.1.3}
     ports:
       - "${DEEP_MARKET_BIND:-0.0.0.0}:${DEEP_MARKET_PORT:-8740}:8740"
     volumes:
