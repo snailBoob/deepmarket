@@ -1,0 +1,101 @@
+name: Attach verified release assets
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Successful Build release assets run ID
+        required: true
+        type: string
+      tag:
+        description: Existing draft release tag
+        required: true
+        default: v1.1.3
+        type: string
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: attach-release-assets-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  attach:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      RUN_ID: ${{ inputs.run_id }}
+      TAG: ${{ inputs.tag }}
+    steps:
+      - name: Verify build and draft identity
+        id: candidate
+        run: |
+          python3 - <<'PY'
+          import json, os, re, subprocess
+          def gh(*args):
+              return json.loads(subprocess.check_output(['gh', *args]))
+          repo, run, tag = (os.environ[k] for k in ['GH_REPO', 'RUN_ID', 'TAG'])
+          assert re.fullmatch(r'[0-9]+', run)
+          assert re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+', tag)
+          build = gh('api', f'repos/{repo}/actions/runs/{run}')
+          assert build['path'] == '.github/workflows/check.yml'
+          assert build['status'] == 'completed' and build['conclusion'] == 'success'
+          assert build['event'] == 'workflow_dispatch'
+          sha = build['head_sha']
+          release = gh('release', 'view', tag, '--json', 'isDraft,targetCommitish')
+          assert release['isDraft'] and release['targetCommitish'] == sha
+          artifacts = gh('api', f'repos/{repo}/actions/runs/{run}/artifacts')['artifacts']
+          expected = {f'release-{tag}-linux-{arch}-{sha}' for arch in ['amd64', 'arm64']}
+          assert {a['name'] for a in artifacts if not a['expired']} == expected
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write(f'sha={sha}\n')
+          print(f'Verified successful build {run} at {sha} for draft {tag}')
+          PY
+      - name: Download directly from the Actions artifact service
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ inputs.run_id }}
+          pattern: release-${{ inputs.tag }}-linux-*-${{ steps.candidate.outputs.sha }}
+          path: ${{ runner.temp }}/release-assets
+      - name: Verify checksums and attach to draft
+        env:
+          CANDIDATE_SHA: ${{ steps.candidate.outputs.sha }}
+          ASSETS: ${{ runner.temp }}/release-assets
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, subprocess
+          root = pathlib.Path(os.environ['ASSETS'])
+          tag, sha = os.environ['TAG'], os.environ['CANDIDATE_SHA']
+          files = {}
+          for arch in ['amd64', 'arm64']:
+              folder = root / f'release-{tag}-linux-{arch}-{sha}'
+              names = {f'deepmarket-{tag}-linux-{arch}.tar.gz',
+                       f'third-party-sources-{tag}-linux-{arch}.tar.gz',
+                       f'IMAGE_ID-linux-{arch}', f'SHA256SUMS-linux-{arch}', 'compose.yaml'}
+              assert {p.name for p in folder.iterdir()} == names
+              subprocess.run(['sha256sum', '--check', f'SHA256SUMS-linux-{arch}'], cwd=folder, check=True)
+              for name in names:
+                  path = folder / name
+                  if name in files:
+                      assert path.read_bytes() == files[name].read_bytes(), 'Compose differs between architectures'
+                  files[name] = path
+          release = json.loads(subprocess.check_output(['gh', 'release', 'view', tag,
+              '--json', 'isDraft,targetCommitish,assets']))
+          assert release['isDraft'] and release['targetCommitish'] == sha
+          existing = {a['name']: a for a in release['assets']}
+          assert existing.keys() <= files.keys()
+          for name, path in sorted(files.items()):
+              with path.open('rb') as stream:
+                  digest = 'sha256:' + hashlib.file_digest(stream, 'sha256').hexdigest()
+              if name in existing:
+                  asset = json.loads(subprocess.check_output(['gh', 'api', existing[name]['apiUrl']]))
+                  assert asset.get('digest') == digest, f'Existing asset differs: {name}'
+              else:
+                  subprocess.run(['gh', 'release', 'upload', tag, str(path)], check=True)
+              print(f'{digest}  {name}')
+          print('All nine verified files attached. Release remains a draft for publication.')
+          PY
