@@ -68,8 +68,8 @@ SETTINGS_NUM = {
     "volumeDotSize": (0.0, 100.0, 40.0),
     "clustering": (0.0, 100.0, 52.0),
     "transparency": (0.0, 100.0, 41.0),
-    "minVolume": (0.0, 1e12, 0.0),       # absolute cluster delta, in coins
-    "minTradeSize": (0.0, 1e12, 0.0),    # source record quantity, in coins
+    "minVolume": (0.0, 1e12, 0.1),       # absolute cluster delta, in coins
+    "minTradeSize": (0.0, 1e12, 0.1),    # source record quantity, in coins
     "lowerCutoff": (0.0, 99.0, 15.0),
     "upperCutoff": (1.0, 100.0, 96.0),
     "heatmapIntensity": (0.0, 100.0, 60.0),  # 100 = undimmed
@@ -878,7 +878,7 @@ async def post_tab(request):
     try:
         body = await request.json()
         inst = f"{str(body['symbol']).upper().strip()}@{str(body.get('platform', 'BNF')).upper()}"
-        coin = await engine.add(inst, int(body.get("gran") or 1),
+        coin = await engine.add(inst, int(body.get("gran") or 10),
                                 _size_gran(body["sizeGran"]) if body.get("sizeGran") else None)
     except (KeyError, TypeError, ValueError) as e:
         return _bad(str(e))
@@ -969,7 +969,7 @@ async def main(args):
     # Tabs from the last run; the command line only seeds the very first start.
     tabs = load_tabs()
     if tabs is None:
-        tabs = [{"inst": s} for s in args.symbols]
+        tabs = [{"inst": s, "gran": 10} for s in args.symbols]
     for t in tabs:
         try:
             await engine.add(t["inst"], t.get("gran", 1), t.get("sizeGran"))
@@ -1032,7 +1032,7 @@ async def main(args):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("symbols", nargs="*", default=["ALTUSDT@BNF"],
+    ap.add_argument("symbols", nargs="*", default=[],
                     help="instruments for the very first start (afterwards data/tabs.json is used)")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8740)

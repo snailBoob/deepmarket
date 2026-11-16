@@ -43,7 +43,7 @@ const DISPLAY_DEFAULTS = {
   brightness: 100, contrast: 0,
 };
 const DEFAULT_SETTINGS = {
-  ...DISPLAY_DEFAULTS, minVolume: 0, minTradeSize: 0,
+  ...DISPLAY_DEFAULTS, minVolume: 0.1, minTradeSize: 0.1,
   adjustOnRecenter: true, adjustByTime: true, adjustInterval: 10,
   units: "base", tz: TZ_DEFAULT, nowFrac: 0.7,
 };
@@ -1507,6 +1507,17 @@ function updateButtons() {
 
 $("btn-back").addEventListener("click", goBack);
 $("btn-live").addEventListener("click", goLive);
+const IS_MAC = /Mac/.test(navigator.platform);
+window.addEventListener("keydown", (e) => {
+  const modifier = IS_MAC ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;
+  if (!modifier || e.altKey || e.shiftKey || !/^Digit[1-9]$/.test(e.code)) return;
+  if ($("display-settings").matches(":popover-open") || $("dlg").classList.contains("open") ||
+      e.target.matches("input, select, textarea") || e.target.isContentEditable) return;
+  // Reserve all nine tab positions, even when that position is not open yet.
+  e.preventDefault();
+  const inst = S.order[Number(e.code.slice(-1)) - 1];
+  if (inst && inst !== S.symbol) selectTab(inst);
+}, { capture: true });
 window.addEventListener("keydown", (e) => {
   if ($("display-settings").matches(":popover-open") || $("dlg").classList.contains("open") ||
       e.target.matches("input, select, textarea")) return;
@@ -1597,6 +1608,7 @@ async function closeTab(inst) {
 
 const symbolLists = {};   // platform -> [{symbol, tick, step}]
 let dlgEdit = null;       // instrument being edited, or null when adding
+let dlgChoice = null;     // instrument whose tick choice is currently shown
 
 // ---------- custom dropdown lists (native selects/datalists break the dark theme) ------
 
@@ -1787,9 +1799,12 @@ function onSymbolTyped() {
   $("dlg-ok").disabled = !hit;
   $("dlg-err").textContent = sym && !hit && list.length ? "Unknown coin on this platform" : "";
   if (hit) {
-    fillTickChoices(hit.tick, Number($("dlg-tick").value) || 1);
+    const choice = `${$("dlg-platform").value}:${hit.symbol}`;
+    fillTickChoices(hit.tick, choice === dlgChoice ? Number($("dlg-tick").value) : 10);
+    dlgChoice = choice;
     fillSizeChoices(hit.step, null);
   } else if (!dlgEdit) {
+    dlgChoice = null;
     ddTick.set([], "");
     ddSize.set([], "");
     ddTick.disable(true);
@@ -1800,6 +1815,7 @@ function onSymbolTyped() {
 
 async function openDialog(editInst = null) {
   dlgEdit = editInst;
+  dlgChoice = null;
   const m = editInst ? S.meta[editInst] : null;
   $("dlg-title").textContent = editInst ? `Edit ${editInst}` : "Add coin";
   $("dlg-ok").textContent = editInst ? "Save" : "Subscribe";
