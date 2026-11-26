@@ -9,7 +9,7 @@ on:
       tag:
         description: Existing draft release tag
         required: true
-        default: v1.1.5
+        default: v1.1.6
         type: string
 
 permissions:
